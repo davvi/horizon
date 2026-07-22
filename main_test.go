@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/rivo/tview"
 )
 
 func TestParseEnvFileAndScript(t *testing.T) {
@@ -112,6 +114,60 @@ func TestInsertServerLine(t *testing.T) {
 	}
 	if got := insertServerLine("", "new u@h:22", "prod"); got != "[prod]\nnew u@h:22\n" {
 		t.Errorf("empty file with group: %q", got)
+	}
+}
+
+func TestScrollBarGeometry(t *testing.T) {
+	newPane := func(lines int) *macScrollList {
+		l := tview.NewList()
+		if lines == 1 {
+			l.ShowSecondaryText(false)
+		}
+		l.SetBorderPadding(1, 0, 1, 1)
+		l.SetBorder(true)
+		m := newMacScrollList(l, lines)
+		m.SetRect(0, 0, 40, 12) // inner: x=2 y=2 w=36 h=9
+		return m
+	}
+
+	m := newPane(1)
+	for i := 0; i < 5; i++ {
+		m.AddItem("item", "", 0, nil)
+	}
+	if _, _, _, _, _, ok := m.barGeometry(); ok {
+		t.Fatal("no bar expected when the list fits")
+	}
+	for i := 0; i < 15; i++ {
+		m.AddItem("item", "", 0, nil)
+	}
+	barX, top, height, thumbTop, thumbH, ok := m.barGeometry()
+	if !ok {
+		t.Fatal("bar expected for 20 items in 9 rows")
+	}
+	// Bar sits in the right padding column, spans the inner height, and the
+	// thumb starts at the top of the track while scrolled to item 0.
+	if barX != 38 || top != 2 || height != 9 || thumbTop != 3 {
+		t.Fatalf("bar = x%d top%d h%d thumbTop%d", barX, top, height, thumbTop)
+	}
+	if thumbH != 7*9/20 {
+		t.Fatalf("thumbH = %d", thumbH)
+	}
+	m.SetOffset(11, 0) // bottom: maxOff = 20-9
+	if _, _, _, thumbTop, _, _ = m.barGeometry(); thumbTop != 3+7-thumbH {
+		t.Fatalf("thumb not at track bottom: %d", thumbTop)
+	}
+
+	// Two-line items: 9 rows show 4 items, so 4 items fit and 5 overflow.
+	m = newPane(2)
+	for i := 0; i < 4; i++ {
+		m.AddItem("item", "", 0, nil)
+	}
+	if _, _, _, _, _, ok := m.barGeometry(); ok {
+		t.Fatal("no bar expected for 4 two-line items")
+	}
+	m.AddItem("item", "", 0, nil)
+	if _, _, _, _, _, ok := m.barGeometry(); !ok {
+		t.Fatal("bar expected for 5 two-line items")
 	}
 }
 

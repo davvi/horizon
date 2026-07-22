@@ -119,7 +119,10 @@ ControlMaster sockets for live connections. Managed automatically.
 
 ## Using the UI
 
-Everything is clickable with the mouse, and fully usable from the keyboard:
+Everything is clickable with the mouse, and fully usable from the keyboard.
+When a pane holds more than fits, a classic Mac scroll bar appears on its
+right edge — click the arrows to scroll by one item, the track to scroll by
+a page, or just use the mouse wheel and arrow keys.
 
 | Key            | Action                                     |
 | -------------- | ------------------------------------------ |

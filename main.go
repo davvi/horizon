@@ -95,8 +95,8 @@ var (
 	baseDir    string
 	app        *tview.Application
 	pages      *tview.Pages
-	serverList *tview.List
-	envList    *tview.List
+	serverList *macScrollList
+	envList    *macScrollList
 	servers    []Server
 	serverRows []serverRow
 	collapsed  = map[string]bool{} // group name -> folded shut
@@ -494,7 +494,9 @@ func connect(s Server, envPath string, reuse bool) {
 // ---------- UI ----------
 
 func buildMain() tview.Primitive {
-	serverList = tview.NewList()
+	// Each server item is two screen lines (the empty secondary line is the
+	// spacing), env file items are one.
+	serverList = newMacScrollList(tview.NewList(), 2)
 	serverList.SetSelectedTextColor(tcell.ColorWhite).
 		SetSelectedBackgroundColor(tcell.ColorBlack).
 		SetSelectedFocusOnly(true). // no highlight while the pane is unfocused
@@ -514,7 +516,7 @@ func buildMain() tview.Primitive {
 		}
 	})
 
-	envList = tview.NewList().ShowSecondaryText(false)
+	envList = newMacScrollList(tview.NewList().ShowSecondaryText(false), 1)
 	envList.SetSelectedTextColor(tcell.ColorWhite).
 		SetSelectedBackgroundColor(tcell.ColorBlack).
 		SetSelectedFocusOnly(true).
@@ -931,6 +933,101 @@ func dialog(name, text string, buttons []string, done func(label string)) {
 func styleForm(form *tview.Form) {
 	form.SetButtonStyle(tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorBlack)).
 		SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite))
+}
+
+// macScrollList wraps a List and draws a classic Mac scroll bar — arrow
+// caps, stippled track, solid thumb — in the list's right border-padding
+// column whenever the items overflow the pane. The arrows scroll by one
+// item, the track by a page. lines is how many screen lines one item takes
+// (2 with secondary text, 1 without).
+type macScrollList struct {
+	*tview.List
+	lines int
+}
+
+func newMacScrollList(l *tview.List, linesPerItem int) *macScrollList {
+	return &macScrollList{List: l, lines: linesPerItem}
+}
+
+// barGeometry reports where the scroll bar goes: the column, the top row
+// and height of the whole bar (arrows included), and the thumb's rows.
+// ok is false when everything fits and no bar should be drawn.
+func (m *macScrollList) barGeometry() (barX, top, height, thumbTop, thumbH int, ok bool) {
+	x, y, w, h := m.GetInnerRect()
+	total := m.GetItemCount()
+	vis := h / m.lines
+	trackH := h - 2
+	if vis < 1 || total <= vis || trackH < 1 {
+		return 0, 0, 0, 0, 0, false
+	}
+	barX = x + w // the right border-padding column
+	thumbH = trackH * vis / total
+	if thumbH < 1 {
+		thumbH = 1
+	}
+	off, _ := m.GetOffset()
+	maxOff := total - vis
+	if off < 0 {
+		off = 0
+	}
+	if off > maxOff {
+		off = maxOff
+	}
+	thumbTop = y + 1 + (trackH-thumbH)*off/maxOff
+	return barX, y, h, thumbTop, thumbH, true
+}
+
+func (m *macScrollList) Draw(screen tcell.Screen) {
+	m.List.Draw(screen)
+	barX, top, height, thumbTop, thumbH, ok := m.barGeometry()
+	if !ok {
+		return
+	}
+	arrow := tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorBlack)
+	track := tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorGray)
+	screen.SetContent(barX, top, '▲', nil, arrow)
+	screen.SetContent(barX, top+height-1, '▼', nil, arrow)
+	for row := top + 1; row < top+height-1; row++ {
+		ch, st := '▒', track
+		if row >= thumbTop && row < thumbTop+thumbH {
+			ch, st = '█', arrow
+		}
+		screen.SetContent(barX, row, ch, nil, st)
+	}
+}
+
+func (m *macScrollList) MouseHandler() func(tview.MouseAction, *tcell.EventMouse, func(tview.Primitive)) (bool, tview.Primitive) {
+	return func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(tview.Primitive)) (bool, tview.Primitive) {
+		mx, my := event.Position()
+		if barX, top, height, thumbTop, thumbH, ok := m.barGeometry(); ok && mx == barX &&
+			my >= top && my < top+height {
+			if action == tview.MouseLeftDown {
+				_, _, _, h := m.GetInnerRect()
+				vis := h / m.lines
+				off, _ := m.GetOffset()
+				switch {
+				case my == top:
+					off--
+				case my == top+height-1:
+					off++
+				case my < thumbTop:
+					off -= vis
+				case my >= thumbTop+thumbH:
+					off += vis
+				}
+				if off < 0 {
+					off = 0
+				}
+				m.SetOffset(off, 0)
+				setFocus(m)
+			}
+			// Swallow the whole press so the list never sees it.
+			return action == tview.MouseLeftDown || action == tview.MouseLeftClick, nil
+		}
+		// Redirect focus to the wrapper so focus comparisons (Tab ring,
+		// keyboard shortcuts) keep seeing one primitive.
+		return m.List.MouseHandler()(action, event, func(tview.Primitive) { setFocus(m) })
+	}
 }
 
 // shadowed draws a classic Mac one-cell drop shadow behind its primitive.
