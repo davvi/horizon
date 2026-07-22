@@ -101,6 +101,8 @@ var (
 	serverRows []serverRow
 	collapsed  = map[string]bool{} // group name -> folded shut
 	config     Config
+	aliveMu    sync.Mutex
+	aliveState = map[string]bool{} // server name -> has a live reusable master
 	pingMu     sync.Mutex
 	pingText   = map[string]string{} // server name -> RTT / "not reachable"
 	pending    *pendingConn
@@ -153,8 +155,22 @@ func main() {
 	app = tview.NewApplication().EnableMouse(true)
 	pages = tview.NewPages()
 	pages.AddPage("main", buildMain(), true, true)
-	refreshServers()
-	startPings()
+	refreshData()
+
+	// Nothing that touches the network runs before the first frame: the list is
+	// drawn from the text files alone, and the scans (ssh master checks, and the
+	// optional pings) start once the UI is on screen and fill their columns in
+	// as answers arrive.
+	var scans sync.Once
+	app.SetAfterDrawFunc(func(tcell.Screen) {
+		scans.Do(func() {
+			list := servers
+			go func() {
+				app.QueueUpdateDraw(startPings)
+				refreshAlive(list)
+			}()
+		})
+	})
 
 	if err := app.SetRoot(pages, true).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "horizon:", err)
@@ -358,8 +374,56 @@ func socketPath(s Server) string {
 	return filepath.Join(baseDir, "sockets", s.Name+"-"+s.Port)
 }
 
+// aliveTimeout caps a single master check. The check only talks to a local
+// unix socket and normally answers in a few milliseconds; a master that is
+// wedged on a dead network accepts the connection and then never replies, and
+// ssh itself would wait forever.
+const aliveTimeout = 1500 * time.Millisecond
+
 func alive(s Server) bool {
-	return exec.Command("ssh", "-o", "ControlPath="+socketPath(s), "-O", "check", s.Target).Run() == nil
+	ctx, cancel := context.WithTimeout(context.Background(), aliveTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "ssh",
+		"-o", "ControlPath="+socketPath(s), "-O", "check", s.Target).Run() == nil
+}
+
+// refreshAlive checks every server in the background and returns immediately.
+// Each result lands on its own, so one wedged master delays only its own line
+// and never the other servers. The list renders from aliveState, so neither the
+// first paint nor a folder toggle waits on ssh. Takes the server slice as an
+// argument because the checks run off the UI goroutine, which owns the global.
+func refreshAlive(list []Server) {
+	aliveMu.Lock()
+	current := make(map[string]bool, len(list))
+	for _, s := range list {
+		current[s.Name] = true
+	}
+	for name := range aliveState {
+		if !current[name] { // server dropped from the file
+			delete(aliveState, name)
+		}
+	}
+	aliveMu.Unlock()
+
+	for _, s := range list {
+		s := s
+		go func() {
+			ok := alive(s)
+			aliveMu.Lock()
+			changed := aliveState[s.Name] != ok
+			aliveState[s.Name] = ok
+			aliveMu.Unlock()
+			if changed {
+				app.QueueUpdateDraw(rebuildServerList)
+			}
+		}()
+	}
+}
+
+func isAlive(name string) bool {
+	aliveMu.Lock()
+	defer aliveMu.Unlock()
+	return aliveState[name]
 }
 
 // ---------- startup pings (optional, see config.txt) ----------
@@ -683,10 +747,17 @@ func closeModal() {
 	}
 }
 
-func refreshServers() {
+// refreshData redraws both panes straight from the text files. It touches
+// nothing but local disk, so it is safe on the path to the first frame.
+func refreshData() {
 	servers = loadServers()
 	rebuildServerList()
 	refreshEnvList()
+}
+
+func refreshServers() {
+	refreshData()
+	refreshAlive(servers)
 }
 
 // rebuildServerList redraws the server pane: servers with a live connection
@@ -699,10 +770,9 @@ func rebuildServerList() {
 	serverList.Clear()
 	serverRows = serverRows[:0]
 
-	// alive() shells out to ssh, so ask once per server per redraw.
 	connected := map[string]bool{}
 	for _, s := range servers {
-		connected[s.Name] = alive(s)
+		connected[s.Name] = isAlive(s.Name)
 	}
 
 	addServer := func(s Server, indent string) {
