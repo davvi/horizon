@@ -1,0 +1,17 @@
+# Built binary
+/horizon
+
+# Release artifacts
+/dist/
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+
+# OS cruft
+.DS_Store
+
+# Local scratch
+text.txt
+.claude/
