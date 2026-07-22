@@ -116,6 +116,7 @@ var (
 	aliveState = map[string]bool{} // server name -> has a live reusable master
 	probeMu    sync.Mutex
 	probeText  = map[string]string{} // server name -> RTT / port state / "not reachable"
+	probeGen   int                   // bumped by startProbes; stale probe goroutines see a mismatch and drop their result
 	pending    *pendingConn
 	modals     []modalEntry
 	focusRing  []tview.Primitive
@@ -123,14 +124,23 @@ var (
 )
 
 func main() {
-	flag.StringVar(&baseDir, "f", filepath.Join(os.Getenv("HOME"), ".horizon"),
-		"folder holding Horizon's txt files")
+	flag.StringVar(&baseDir, "f", "",
+		"folder holding Horizon's txt files (default ~/.horizon)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("horizon", version)
 		return
+	}
+
+	if baseDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "horizon: cannot determine home directory:", err)
+			os.Exit(1)
+		}
+		baseDir = filepath.Join(home, ".horizon")
 	}
 
 	if err := ensureFiles(); err != nil {
@@ -192,7 +202,12 @@ func main() {
 	// session (if any) directly, then fall back to the user's local shell.
 	if pending != nil {
 		if pending.killSock != "" {
-			exec.Command("ssh", "-o", "ControlPath="+pending.killSock, "-O", "exit", pending.target).Run()
+			// Bounded like alive(): a wedged master accepts the socket
+			// connection and never replies, and ssh would wait forever.
+			ctx, cancel := context.WithTimeout(context.Background(), aliveTimeout)
+			exec.CommandContext(ctx, "ssh",
+				"-o", "ControlPath="+pending.killSock, "-O", "exit", "--", pending.target).Run()
+			cancel()
 		}
 		fmt.Printf("horizon: connecting to %s (%s)...\n", pending.name, pending.target)
 		cmd := exec.Command("ssh", pending.args...)
@@ -241,6 +256,7 @@ func loadServers() []Server {
 	}
 	var out []Server
 	group := ""
+	seen := map[string]bool{}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -258,9 +274,41 @@ func loadServers() []Server {
 		if host, port, ok := strings.Cut(s.Target, ":"); ok {
 			s.Target, s.Port = host, port
 		}
+		// The name doubles as the socket file name and the key of every
+		// per-server map, and target/port become ssh arguments; drop entries
+		// a hand-edit made unsafe or ambiguous rather than let them through.
+		if !validName(s.Name) || seen[s.Name] ||
+			strings.HasPrefix(s.Target, "-") || strings.HasPrefix(s.Port, "-") {
+			continue
+		}
+		seen[s.Name] = true
 		out = append(out, s)
 	}
 	return out
+}
+
+// validName reports whether a server name is safe to use as a map key and as
+// the socket file's name: no path tricks (it must be its own base name), no
+// leading "-" (would read as an ssh option) or "[" (would read as a group
+// header when written back), no whitespace.
+func validName(name string) bool {
+	switch name {
+	case "", ".", "..":
+		return false
+	}
+	if strings.HasPrefix(name, "-") || strings.HasPrefix(name, "[") {
+		return false
+	}
+	if strings.ContainsAny(name, " \t") {
+		return false
+	}
+	return name == filepath.Base(name)
+}
+
+// validPort reports whether p is a usable TCP port number.
+func validPort(p string) bool {
+	n, err := strconv.Atoi(p)
+	return err == nil && n >= 1 && n <= 65535
 }
 
 // parseConfig reads KEY=value lines; unknown keys and malformed lines are
@@ -397,7 +445,7 @@ func alive(s Server) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), aliveTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, "ssh",
-		"-o", "ControlPath="+socketPath(s), "-O", "check", s.Target).Run() == nil
+		"-o", "ControlPath="+socketPath(s), "-O", "check", "--", s.Target).Run() == nil
 }
 
 // refreshAlive checks every server in the background and returns immediately.
@@ -464,16 +512,27 @@ func parsePingAvg(out string) (string, bool) {
 }
 
 // startProbes checks every server concurrently and redraws the list as each
-// result arrives. Does nothing unless ping or port_check is on in config.txt.
+// result arrives. Runs on the UI goroutine (startup, and every refresh).
+// probeText is rebuilt from scratch so removed servers don't linger, and the
+// generation counter keeps stragglers from an earlier round from writing
+// stale results into the new map. With both probes off it only clears any
+// leftover probe text.
 func startProbes() {
-	if !config.Ping && !config.PortCheck {
+	cfg := config
+	probeMu.Lock()
+	probeGen++
+	gen := probeGen
+	if !cfg.Ping && !cfg.PortCheck {
+		probeText = map[string]string{}
+		probeMu.Unlock()
+		rebuildServerList()
 		return
 	}
 	wait := "checking port…"
-	if config.Ping {
+	if cfg.Ping {
 		wait = "pinging…"
 	}
-	probeMu.Lock()
+	probeText = make(map[string]string, len(servers))
 	for _, s := range servers {
 		probeText[s.Name] = wait
 	}
@@ -482,9 +541,11 @@ func startProbes() {
 	for _, s := range servers {
 		s := s
 		go func() {
-			res := probeServer(s)
+			res := probeServer(s, cfg)
 			probeMu.Lock()
-			probeText[s.Name] = res
+			if probeGen == gen {
+				probeText[s.Name] = res
+			}
 			probeMu.Unlock()
 			app.QueueUpdateDraw(rebuildServerList)
 		}()
@@ -495,14 +556,14 @@ func startProbes() {
 // when the ping answers, otherwise — with port_check=on — whether the ssh port
 // still accepts connections, which is the useful answer for the many hosts
 // that drop ICMP but serve ssh fine.
-func probeServer(s Server) string {
-	if config.Ping {
-		if avg, ok := pingProbe(s); ok {
+func probeServer(s Server, cfg Config) string {
+	if cfg.Ping {
+		if avg, ok := pingProbe(s, cfg); ok {
 			return avg + " ms"
 		}
 	}
-	if config.PortCheck && portOpen(s) {
-		if config.Ping {
+	if cfg.PortCheck && portOpen(s) {
+		if cfg.Ping {
 			return "no ping — port " + s.Port + " open"
 		}
 		return "port " + s.Port + " open"
@@ -525,18 +586,19 @@ func unreachable(name string) bool {
 
 // pingProbe is the ping leg of probeServer, indirected so tests can drive the
 // fallback without a host that really drops ICMP.
-var pingProbe = pingServer
+var pingProbe func(Server, Config) (string, bool) = pingServer
 
 // pingServer returns the average round-trip time in milliseconds, or ok=false
-// on timeout, packet loss or any error.
-func pingServer(s Server) (string, bool) {
+// on timeout, packet loss or any error. The config travels as an argument
+// because the probes run off the UI goroutine, which owns the global.
+func pingServer(s Server, cfg Config) (string, bool) {
 	// N pings go out one second apart; the margin covers DNS and the last
 	// reply.
 	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(config.PingCount+5)*time.Second)
+		time.Duration(cfg.PingCount+5)*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ping", "-n", "-q",
-		"-c", strconv.Itoa(config.PingCount), hostOf(s.Target)).Output()
+		"-c", strconv.Itoa(cfg.PingCount), "--", hostOf(s.Target)).Output()
 	if err != nil {
 		return "", false
 	}
@@ -580,7 +642,10 @@ func buildScript(vars, cmds []string) string {
 	// now holds, and each command that ran, before handing over the shell.
 	parts = append(parts, buildReport(vars, cmds)...)
 	parts = append(parts, `exec "$SHELL" -l`)
-	return strings.Join(parts, "; ")
+	// One command per line: the whole script travels as a single ssh argument,
+	// and newlines keep a user command's inline "#" comment or trailing "&"
+	// from eating the commands that follow it, as a "; " join would.
+	return strings.Join(parts, "\n")
 }
 
 // buildReport emits shell snippets that print a summary of the applied
@@ -616,7 +681,7 @@ func connect(s Server, envPath string, reuse bool) {
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath=" + sock,
 		"-o", "ControlPersist=yes",
-		"-p", s.Port, "-t", s.Target,
+		"-p", s.Port, "-t", "--", s.Target,
 	}
 	if !reuse && envPath != "" {
 		vars, cmds, err := parseEnvFile(envPath)
@@ -864,8 +929,10 @@ func refreshData() {
 }
 
 func refreshServers() {
+	loadConfig() // config.txt edits take effect without a restart
 	refreshData()
 	refreshAlive(servers)
+	startProbes()
 }
 
 // rebuildServerList redraws the server pane: servers with a live connection
@@ -1040,22 +1107,47 @@ func showEnvEditForm(path string) {
 	showModal("envEdit", form, 76, 14)
 }
 
+// selecting is true while selectServer's fresh master check is in flight, so
+// pressing Enter again cannot stack a second check and a duplicate dialog.
+// Only touched on the UI goroutine.
+var selecting bool
+
+// selectServer freshly checks the server's master and opens the matching
+// dialog. The check runs off the UI goroutine: against a wedged master it
+// takes the full aliveTimeout, which would otherwise freeze the whole UI.
 func selectServer(s Server) {
-	if !alive(s) {
-		showEnvChooser(s)
+	if selecting {
 		return
 	}
-	dialog("reuse",
-		fmt.Sprintf("A live connection to “%s” already exists.\nReuse it or create a new one?", s.Name),
-		[]string{"Reuse", "New connection", "Cancel"},
-		func(label string) {
-			switch label {
-			case "Reuse":
-				connect(s, "", true)
-			case "New connection":
-				showEnvChooser(s)
+	selecting = true
+	go func() {
+		ok := alive(s)
+		aliveMu.Lock()
+		changed := aliveState[s.Name] != ok
+		aliveState[s.Name] = ok
+		aliveMu.Unlock()
+		app.QueueUpdateDraw(func() {
+			selecting = false
+			if changed {
+				rebuildServerList()
 			}
+			if !ok {
+				showEnvChooser(s)
+				return
+			}
+			dialog("reuse",
+				fmt.Sprintf("A live connection to “%s” already exists.\nReuse it or create a new one?", s.Name),
+				[]string{"Reuse", "New connection", "Cancel"},
+				func(label string) {
+					switch label {
+					case "Reuse":
+						connect(s, "", true)
+					case "New connection":
+						showEnvChooser(s)
+					}
+				})
 		})
+	}()
 }
 
 func showEnvChooser(s Server) {
@@ -1090,16 +1182,22 @@ func showServerForm() {
 		target := strings.TrimSpace(form.GetFormItemByLabel("Target (user@host)").(*tview.InputField).GetText())
 		port := strings.TrimSpace(form.GetFormItemByLabel("Port").(*tview.InputField).GetText())
 		group := strings.TrimSpace(form.GetFormItemByLabel("Group (optional)").(*tview.InputField).GetText())
-		if name == "" || strings.ContainsAny(name, " \t/") {
-			errModal("Name is required and may not contain spaces or slashes.")
+		if !validName(name) {
+			errModal("Name is required and may not contain spaces, slashes\nor a leading “-” or “[”.")
 			return
 		}
-		if target == "" || strings.ContainsAny(target, " \t") {
-			errModal("Target is required, e.g. deploy@203.0.113.10")
+		for _, s := range servers {
+			if s.Name == name {
+				errModal(fmt.Sprintf("A server named “%s” already exists.", name))
+				return
+			}
+		}
+		if target == "" || strings.ContainsAny(target, " \t:") || strings.HasPrefix(target, "-") {
+			errModal("Target is required, e.g. deploy@203.0.113.10\n(no port here — that goes in the Port field).")
 			return
 		}
-		if _, err := strconv.Atoi(port); err != nil {
-			errModal("Port must be a number.")
+		if !validPort(port) {
+			errModal("Port must be a number between 1 and 65535.")
 			return
 		}
 		if strings.ContainsAny(group, "[]#") {
@@ -1212,7 +1310,22 @@ func dialog(name, text string, buttons []string, done func(label string)) {
 		AddItem(form, 3, 0, true)
 	f.SetBorderPadding(1, 0, 2, 2)
 	f.SetBorder(true)
-	showModal(name, f, 56, strings.Count(text, "\n")+8)
+	// Size the box by the lines the text will actually occupy once wrapped
+	// to the dialog's inner width, so long one-line messages (typically OS
+	// error strings) aren't clipped. Word-wrap can break a line early, so
+	// wrapped lines get one spare row.
+	const dialogW = 56
+	const innerW = dialogW - 6 // border + side padding
+	lines := 0
+	for _, ln := range strings.Split(text, "\n") {
+		n := (utf8.RuneCountInString(ln) + innerW - 1) / innerW
+		if n > 1 {
+			n++
+		}
+		lines += max(n, 1)
+	}
+	// borders (2) + top padding (1) + buttons (3) + a blank spacer row.
+	showModal(name, f, dialogW, lines+7)
 }
 
 // styleForm gives a form classic Mac push buttons: white with black labels,

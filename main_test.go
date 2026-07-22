@@ -33,19 +33,36 @@ echo ready
 	}
 
 	got := buildScript(vars, cmds)
-	want := `export APP_ENV='staging'; export GREETING='it'\''s a '\''test'\'''; ` +
-		`cd /srv/app; echo ready; ` +
-		`printf '\n== Horizon: environment applied ==\n'; ` +
-		`printf 'Variables set:\n'; ` +
-		`printf '  %s=%s\n' 'APP_ENV' "$APP_ENV"; ` +
-		`printf '  %s=%s\n' 'GREETING' "$GREETING"; ` +
-		`printf 'Commands run:\n'; ` +
-		`printf '  %s\n' 'cd /srv/app'; ` +
-		`printf '  %s\n' 'echo ready'; ` +
-		`printf '\n'; ` +
-		`exec "$SHELL" -l`
+	want := strings.Join([]string{
+		`export APP_ENV='staging'`,
+		`export GREETING='it'\''s a '\''test'\'''`,
+		`cd /srv/app`,
+		`echo ready`,
+		`printf '\n== Horizon: environment applied ==\n'`,
+		`printf 'Variables set:\n'`,
+		`printf '  %s=%s\n' 'APP_ENV' "$APP_ENV"`,
+		`printf '  %s=%s\n' 'GREETING' "$GREETING"`,
+		`printf 'Commands run:\n'`,
+		`printf '  %s\n' 'cd /srv/app'`,
+		`printf '  %s\n' 'echo ready'`,
+		`printf '\n'`,
+		`exec "$SHELL" -l`,
+	}, "\n")
 	if got != want {
 		t.Fatalf("script:\n got %s\nwant %s", got, want)
+	}
+}
+
+// A user command carrying an inline "#" comment (or a trailing "&") must not
+// swallow the rest of the script: each part sits on its own line, so the
+// final exec of the login shell always survives.
+func TestBuildScriptSurvivesInlineComment(t *testing.T) {
+	got := buildScript(nil, []string{"echo hi  # just saying hi"})
+	if !strings.HasSuffix(got, "\nexec \"$SHELL\" -l") {
+		t.Fatalf("login-shell exec lost after inline comment:\n%s", got)
+	}
+	if strings.Contains(got, "; ") {
+		t.Fatalf("script joined with semicolons:\n%s", got)
 	}
 }
 
@@ -178,6 +195,54 @@ func TestServerRowColumnsAlign(t *testing.T) {
 	for _, ln := range lines[1:] {
 		if strings.Contains(ln, "● connected") {
 			t.Fatalf("unexpected marker on %q", ln)
+		}
+	}
+}
+
+// Hand-edited entries that would escape the sockets folder, read as an ssh
+// or ping option, or collide with an earlier name are dropped on load.
+func TestLoadServersSkipsUnsafeEntries(t *testing.T) {
+	baseDir = t.TempDir()
+	os.WriteFile(filepath.Join(baseDir, serversFileName), []byte(`ok deploy@203.0.113.10
+../../evil deploy@203.0.113.11
+-dash deploy@203.0.113.12
+sub/dir deploy@203.0.113.13
+ok deploy@203.0.113.14
+badtarget -oProxyCommand=payload
+badport deploy@203.0.113.15:-1
+`), 0o600)
+
+	s := loadServers()
+	if len(s) != 1 {
+		t.Fatalf("servers = %+v", s)
+	}
+	if s[0] != (Server{"ok", "deploy@203.0.113.10", "22", ""}) {
+		t.Fatalf("s[0] = %+v", s[0])
+	}
+}
+
+func TestValidName(t *testing.T) {
+	for _, name := range []string{"web1", "db.internal", "a_b-c"} {
+		if !validName(name) {
+			t.Errorf("validName(%q) = false", name)
+		}
+	}
+	for _, name := range []string{"", ".", "..", "-dash", "[group", "a/b", "../x", "a b"} {
+		if validName(name) {
+			t.Errorf("validName(%q) = true", name)
+		}
+	}
+}
+
+func TestValidPort(t *testing.T) {
+	for _, p := range []string{"1", "22", "65535"} {
+		if !validPort(p) {
+			t.Errorf("validPort(%q) = false", p)
+		}
+	}
+	for _, p := range []string{"", "0", "-1", "65536", "abc", "2 2"} {
+		if validPort(p) {
+			t.Errorf("validPort(%q) = true", p)
 		}
 	}
 }
@@ -463,33 +528,31 @@ func TestProbeServerFallsBackToPortCheck(t *testing.T) {
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 	s := Server{Target: "127.0.0.1", Port: port}
 
-	oldCfg, oldPing := config, pingProbe
-	defer func() { config, pingProbe = oldCfg, oldPing }()
+	oldPing := pingProbe
+	defer func() { pingProbe = oldPing }()
 	// Loopback answers ICMP, so stub the ping leg into always failing —
 	// the point of the fallback is exactly the host that drops ICMP.
-	pingProbe = func(Server) (string, bool) { return "", false }
+	pingProbe = func(Server, Config) (string, bool) { return "", false }
 
 	// Port check off: a failed ping is the whole answer.
-	config = Config{Ping: true, PingCount: 1}
-	if got := probeServer(s); got != "not reachable" {
+	if got := probeServer(s, Config{Ping: true, PingCount: 1}); got != "not reachable" {
 		t.Fatalf("ping only = %q", got)
 	}
 
 	// Port check on: the open port rescues an unreachable-by-ICMP host.
-	config = Config{Ping: true, PingCount: 1, PortCheck: true}
-	if want, got := "no ping — port "+port+" open", probeServer(s); got != want {
+	cfg := Config{Ping: true, PingCount: 1, PortCheck: true}
+	if want, got := "no ping — port "+port+" open", probeServer(s, cfg); got != want {
 		t.Fatalf("fallback = %q, want %q", got, want)
 	}
 
 	// Port check alone, with ping off.
-	config = Config{PingCount: 3, PortCheck: true}
-	if want, got := "port "+port+" open", probeServer(s); got != want {
+	if want, got := "port "+port+" open", probeServer(s, Config{PingCount: 3, PortCheck: true}); got != want {
 		t.Fatalf("port only = %q, want %q", got, want)
 	}
 
 	// Neither answers.
 	ln.Close()
-	if got := probeServer(s); got != "not reachable" {
+	if got := probeServer(s, cfg); got != "not reachable" {
 		t.Fatalf("both failed = %q", got)
 	}
 }
