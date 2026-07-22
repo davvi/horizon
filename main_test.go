@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -172,20 +173,88 @@ func TestScrollBarGeometry(t *testing.T) {
 }
 
 func TestParseConfig(t *testing.T) {
-	if c := parseConfig(""); c.Ping || c.PingCount != 3 {
+	if c := parseConfig(""); c.Ping || c.PingCount != 3 || c.PortCheck {
 		t.Fatalf("defaults = %+v", c)
 	}
-	if c := parseConfig(configTemplate); c.Ping || c.PingCount != 3 {
+	if c := parseConfig(configTemplate); c.Ping || c.PingCount != 3 || c.PortCheck {
 		t.Fatalf("template = %+v", c)
 	}
-	c := parseConfig("# comment\nping = on\nping_count = 5\njunk line\nunknown=1\n")
-	if !c.Ping || c.PingCount != 5 {
+	c := parseConfig("# comment\nping = on\nping_count = 5\nport_check = yes\njunk line\nunknown=1\n")
+	if !c.Ping || c.PingCount != 5 || !c.PortCheck {
 		t.Fatalf("parsed = %+v", c)
 	}
-	// Invalid count falls back to the default; ping stays off unless truthy.
-	c = parseConfig("ping=maybe\nping_count=zero\n")
-	if c.Ping || c.PingCount != 3 {
+	// Invalid count falls back to the default; the flags stay off unless truthy.
+	c = parseConfig("ping=maybe\nping_count=zero\nport_check=sometimes\n")
+	if c.Ping || c.PingCount != 3 || c.PortCheck {
 		t.Fatalf("invalid values = %+v", c)
+	}
+}
+
+func TestHostOf(t *testing.T) {
+	if h := hostOf("deploy@203.0.113.10"); h != "203.0.113.10" {
+		t.Fatalf("with user = %q", h)
+	}
+	if h := hostOf("db.internal"); h != "db.internal" {
+		t.Fatalf("without user = %q", h)
+	}
+}
+
+// portOpen must answer for a listener that is up and for a port that is not,
+// without taking anywhere near the full timeout on the failing case.
+func TestPortOpen(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+
+	if !portOpen(Server{Target: "user@127.0.0.1", Port: port}) {
+		t.Fatal("live listener reported closed")
+	}
+	ln.Close()
+	if portOpen(Server{Target: "127.0.0.1", Port: port}) {
+		t.Fatal("closed port reported open")
+	}
+}
+
+func TestProbeServerFallsBackToPortCheck(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	s := Server{Target: "127.0.0.1", Port: port}
+
+	oldCfg, oldPing := config, pingProbe
+	defer func() { config, pingProbe = oldCfg, oldPing }()
+	// Loopback answers ICMP, so stub the ping leg into always failing —
+	// the point of the fallback is exactly the host that drops ICMP.
+	pingProbe = func(Server) (string, bool) { return "", false }
+
+	// Port check off: a failed ping is the whole answer.
+	config = Config{Ping: true, PingCount: 1}
+	if got := probeServer(s); got != "not reachable" {
+		t.Fatalf("ping only = %q", got)
+	}
+
+	// Port check on: the open port rescues an unreachable-by-ICMP host.
+	config = Config{Ping: true, PingCount: 1, PortCheck: true}
+	if want, got := "no ping — port "+port+" open", probeServer(s); got != want {
+		t.Fatalf("fallback = %q, want %q", got, want)
+	}
+
+	// Port check alone, with ping off.
+	config = Config{PingCount: 3, PortCheck: true}
+	if want, got := "port "+port+" open", probeServer(s); got != want {
+		t.Fatalf("port only = %q, want %q", got, want)
+	}
+
+	// Neither answers.
+	ln.Close()
+	if got := probeServer(s); got != "not reachable" {
+		t.Fatalf("both failed = %q", got)
 	}
 }
 

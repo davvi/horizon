@@ -93,12 +93,23 @@ defaults on first run:
 ```
 ping=off
 ping_count=3
+port_check=off
 ```
 
 With `ping=on`, Horizon pings every server once at startup (`ping_count`
 pings each, concurrently) and shows the average round-trip time on the
 server's line — or `not reachable` if the host doesn't answer. It is off by
 default so starting the UI never waits on the network.
+
+With `port_check=on`, a host that fails the ping gets a second chance: Horizon
+opens a TCP connection to its ssh port (the one from `list_of_servers.txt`, or
+22) with a 1 second timeout. Plenty of servers drop ICMP but accept ssh
+perfectly well, and those show `no ping — port 22 open` instead of being
+written off. Only when both checks fail is the line `not reachable`. The probe
+just completes the handshake and hangs up — nothing is sent, so no ssh banner
+exchange or login attempt is logged on the far side. This is also off by
+default, and works on its own with `ping=off` (the line then reads
+`port 22 open`).
 
 ### `~/.horizon/*.txt` — environment files
 

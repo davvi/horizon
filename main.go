@@ -9,6 +9,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,8 +49,13 @@ const configTemplate = `# Horizon config file — KEY=value lines, # for comment
 #   ping        on/off — ping every server at startup and show the
 #               average round-trip time on its line (default off)
 #   ping_count  how many pings to send per server (default 3)
+#   port_check  on/off — when the ping gets no answer, try to open a TCP
+#               connection to the server's ssh port (1s timeout) so hosts
+#               that only block ICMP still show up as reachable
+#               (default off)
 ping=off
 ping_count=3
+port_check=off
 `
 
 const envTemplate = `# Horizon environment file.
@@ -67,6 +73,7 @@ type Server struct{ Name, Target, Port, Group string }
 type Config struct {
 	Ping      bool // ping servers at startup and show the average RTT
 	PingCount int  // pings sent per server
+	PortCheck bool // fall back to a TCP probe of the ssh port when ping fails
 }
 
 // serverRow is one visible line of the server list: a collapsible group
@@ -103,8 +110,8 @@ var (
 	config     Config
 	aliveMu    sync.Mutex
 	aliveState = map[string]bool{} // server name -> has a live reusable master
-	pingMu     sync.Mutex
-	pingText   = map[string]string{} // server name -> RTT / "not reachable"
+	probeMu    sync.Mutex
+	probeText  = map[string]string{} // server name -> RTT / port state / "not reachable"
 	pending    *pendingConn
 	modals     []modalEntry
 	focusRing  []tview.Primitive
@@ -159,14 +166,14 @@ func main() {
 
 	// Nothing that touches the network runs before the first frame: the list is
 	// drawn from the text files alone, and the scans (ssh master checks, and the
-	// optional pings) start once the UI is on screen and fill their columns in
-	// as answers arrive.
+	// optional reachability probes) start once the UI is on screen and fill
+	// their columns in as answers arrive.
 	var scans sync.Once
 	app.SetAfterDrawFunc(func(tcell.Screen) {
 		scans.Do(func() {
 			list := servers
 			go func() {
-				app.QueueUpdateDraw(startPings)
+				app.QueueUpdateDraw(startProbes)
 				refreshAlive(list)
 			}()
 		})
@@ -273,6 +280,8 @@ func parseConfig(data string) Config {
 			if n, err := strconv.Atoi(v); err == nil && n > 0 {
 				c.PingCount = n
 			}
+		case "port_check":
+			c.PortCheck = v == "on" || v == "true" || v == "yes" || v == "1"
 		}
 	}
 	return c
@@ -426,7 +435,12 @@ func isAlive(name string) bool {
 	return aliveState[name]
 }
 
-// ---------- startup pings (optional, see config.txt) ----------
+// ---------- startup probes (optional, see config.txt) ----------
+
+// portCheckTimeout bounds the TCP probe of the ssh port. It is short on
+// purpose: the probe only runs after a ping already failed, and a server that
+// needs longer than this to answer a SYN is not worth calling reachable.
+const portCheckTimeout = time.Second
 
 // pingAvgRe matches the summary line of both macOS ("round-trip
 // min/avg/max/stddev = a/b/c/d ms") and Linux ("rtt min/avg/max/mdev = ...")
@@ -441,49 +455,92 @@ func parsePingAvg(out string) (string, bool) {
 	return m[1], true
 }
 
-// startPings pings every server concurrently and redraws the list as each
-// result arrives. Does nothing unless ping=on in config.txt.
-func startPings() {
-	if !config.Ping {
+// startProbes checks every server concurrently and redraws the list as each
+// result arrives. Does nothing unless ping or port_check is on in config.txt.
+func startProbes() {
+	if !config.Ping && !config.PortCheck {
 		return
 	}
-	pingMu.Lock()
-	for _, s := range servers {
-		pingText[s.Name] = "pinging…"
+	wait := "checking port…"
+	if config.Ping {
+		wait = "pinging…"
 	}
-	pingMu.Unlock()
+	probeMu.Lock()
+	for _, s := range servers {
+		probeText[s.Name] = wait
+	}
+	probeMu.Unlock()
 	rebuildServerList()
 	for _, s := range servers {
 		s := s
 		go func() {
-			res := pingServer(s)
-			pingMu.Lock()
-			pingText[s.Name] = res
-			pingMu.Unlock()
+			res := probeServer(s)
+			probeMu.Lock()
+			probeText[s.Name] = res
+			probeMu.Unlock()
 			app.QueueUpdateDraw(rebuildServerList)
 		}()
 	}
 }
 
-func pingServer(s Server) string {
-	host := s.Target
-	if _, h, ok := strings.Cut(host, "@"); ok {
-		host = h
+// probeServer returns the status text for one server's line: its average RTT
+// when the ping answers, otherwise — with port_check=on — whether the ssh port
+// still accepts connections, which is the useful answer for the many hosts
+// that drop ICMP but serve ssh fine.
+func probeServer(s Server) string {
+	if config.Ping {
+		if avg, ok := pingProbe(s); ok {
+			return avg + " ms"
+		}
 	}
+	if config.PortCheck && portOpen(s) {
+		if config.Ping {
+			return "no ping — port " + s.Port + " open"
+		}
+		return "port " + s.Port + " open"
+	}
+	return "not reachable"
+}
+
+// pingProbe is the ping leg of probeServer, indirected so tests can drive the
+// fallback without a host that really drops ICMP.
+var pingProbe = pingServer
+
+// pingServer returns the average round-trip time in milliseconds, or ok=false
+// on timeout, packet loss or any error.
+func pingServer(s Server) (string, bool) {
 	// N pings go out one second apart; the margin covers DNS and the last
-	// reply. On timeout or any error the host is reported unreachable.
+	// reply.
 	ctx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(config.PingCount+5)*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ping", "-n", "-q",
-		"-c", strconv.Itoa(config.PingCount), host).Output()
+		"-c", strconv.Itoa(config.PingCount), hostOf(s.Target)).Output()
 	if err != nil {
-		return "not reachable"
+		return "", false
 	}
-	if avg, ok := parsePingAvg(string(out)); ok {
-		return avg + " ms"
+	return parsePingAvg(string(out))
+}
+
+// portOpen reports whether the server's ssh port completes a TCP handshake
+// within portCheckTimeout. Nothing is sent, so no ssh banner exchange or
+// authentication attempt is logged on the far side.
+func portOpen(s Server) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(hostOf(s.Target), s.Port),
+		portCheckTimeout)
+	if err != nil {
+		return false
 	}
-	return "not reachable"
+	conn.Close()
+	return true
+}
+
+// hostOf strips the optional user@ prefix from a target.
+func hostOf(target string) string {
+	if _, h, ok := strings.Cut(target, "@"); ok {
+		return h
+	}
+	return target
 }
 
 func shellQuote(v string) string {
@@ -778,10 +835,10 @@ func rebuildServerList() {
 	addServer := func(s Server, indent string) {
 		serverRows = append(serverRows, serverRow{server: s})
 		line := fmt.Sprintf(" %s%-16s %s:%s", indent, s.Name, s.Target, s.Port)
-		if config.Ping {
-			pingMu.Lock()
-			p := pingText[s.Name]
-			pingMu.Unlock()
+		if config.Ping || config.PortCheck {
+			probeMu.Lock()
+			p := probeText[s.Name]
+			probeMu.Unlock()
 			if p != "" {
 				line += "   " + p
 			}
