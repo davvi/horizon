@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -31,6 +32,9 @@ const (
 	serversFileName = "list_of_servers.txt"
 	configFileName  = "config.txt"
 )
+
+// memberIndent is how far a server sitting inside an open folder is pushed in.
+const memberIndent = "  "
 
 const serversTemplate = `# Horizon servers — one per line:
 #   name  user@host[:port]
@@ -843,21 +847,49 @@ func rebuildServerList() {
 		connected[s.Name] = isAlive(s.Name)
 	}
 
+	// Column widths are measured across every server so the name, address and
+	// probe columns each start at the same screen column on every row —
+	// including rows indented inside a folder, and rows whose probe hasn't
+	// answered yet. Names are budgeted with the indent they'd have inside their
+	// folder, so hoisting a connected server to the top level doesn't shift the
+	// columns. The probe column is only padded as wide as the connected servers
+	// need, because the marker is all that follows it: padding it to a long
+	// probe on some unreachable row would just shove every marker off the pane.
+	probeOn := config.Ping || config.PortCheck
+	nameW, addrW, probeW := 0, 0, 0
+	probeMu.Lock()
+	for _, s := range servers {
+		w := utf8.RuneCountInString(s.Name)
+		if s.Group != "" {
+			w += utf8.RuneCountInString(memberIndent)
+		}
+		nameW = max(nameW, w)
+		addrW = max(addrW, utf8.RuneCountInString(s.Target+":"+s.Port))
+		if probeOn && connected[s.Name] {
+			probeW = max(probeW, utf8.RuneCountInString(probeText[s.Name]))
+		}
+	}
+	probeMu.Unlock()
+
 	addServer := func(s Server, indent string) {
 		serverRows = append(serverRows, serverRow{server: s})
-		line := fmt.Sprintf(" %s%-16s %s:%s", indent, s.Name, s.Target, s.Port)
-		if config.Ping || config.PortCheck {
+		line := fmt.Sprintf(" %-*s %-*s", nameW, indent+s.Name, addrW, s.Target+":"+s.Port)
+		if probeOn {
 			probeMu.Lock()
 			p := probeText[s.Name]
 			probeMu.Unlock()
-			if p != "" {
-				line += "   " + p
+			// Pad only when a marker follows, so the probe stays the last thing
+			// on an unconnected row and never trails needless spaces.
+			if connected[s.Name] {
+				line += fmt.Sprintf("  %-*s", probeW, p)
+			} else if p != "" {
+				line += "  " + p
 			}
 		}
 		if connected[s.Name] {
-			line += "   [::b]● connected — reusable[::-]"
+			line += "  [::b]● connected — reusable[::-]"
 		}
-		serverList.AddItem(line, "", 0, nil)
+		serverList.AddItem(strings.TrimRight(line, " "), "", 0, nil)
 	}
 
 	var groups []string
@@ -895,7 +927,7 @@ func rebuildServerList() {
 		}
 		serverList.AddItem(" ▾ "+g, "", 0, nil)
 		for _, s := range members {
-			addServer(s, "  ")
+			addServer(s, memberIndent)
 		}
 	}
 	if len(servers) == 0 {

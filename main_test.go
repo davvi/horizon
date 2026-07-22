@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gdamore/tcell/v2"
@@ -89,6 +90,95 @@ web2 deploy@203.0.113.11:2222
 	}
 	if s[2] != (Server{"web2", "deploy@203.0.113.11", "2222", "staging"}) {
 		t.Fatalf("s[2] = %+v", s[2])
+	}
+}
+
+// serverRowLines rebuilds the pane and returns just the server rows' text
+// (skipping folder headers), in display order.
+func serverRowLines(t *testing.T) []string {
+	t.Helper()
+	rebuildServerList()
+	var out []string
+	for i, r := range serverRows {
+		if r.header != "" {
+			continue
+		}
+		main, _ := serverList.GetItemText(i)
+		out = append(out, main)
+	}
+	return out
+}
+
+// The name, address and probe columns must begin at the same rune offset on
+// every server row — top-level and folder-indented, connected and not,
+// probe-answered and not — so the list reads as tidy columns.
+func TestServerRowColumnsAlign(t *testing.T) {
+	baseDir = t.TempDir()
+	if err := ensureFiles(); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(baseDir, serversFileName), []byte(
+		"jump  ops@jump.example.com\n"+
+			"[production]\n"+
+			"web1  deploy@203.0.113.10\n"+
+			"longhostname  deploy@10.0.0.9:2222\n"), 0o600)
+	loadConfig()
+	config.Ping, config.PortCheck = true, false
+
+	app = tview.NewApplication()
+	pages = tview.NewPages()
+	buildMain()
+	servers = loadServers()
+	collapsed["production"] = false
+
+	aliveMu.Lock()
+	aliveState = map[string]bool{"jump": true}
+	aliveMu.Unlock()
+	probeMu.Lock()
+	probeText = map[string]string{
+		"jump":         "14.2 ms",
+		"web1":         "no ping — port 22 open",
+		"longhostname": "", // not answered yet
+	}
+	probeMu.Unlock()
+
+	lines := serverRowLines(t)
+	if len(lines) != 3 {
+		t.Fatalf("rows = %q", lines)
+	}
+
+	// The address column starts one space past the widest budgeted name. The
+	// widest name is "longhostname" with its 2-space folder indent (14), so the
+	// address begins at rune 1 (leading space) + 14 + 1 = 16 on every row.
+	const addrCol = 16
+	for _, ln := range lines {
+		r := []rune(ln)
+		if len(r) <= addrCol || r[addrCol-1] != ' ' {
+			t.Fatalf("no gap before address column in %q", ln)
+		}
+		// The address text (a host) must sit exactly at addrCol.
+		if r[addrCol] == ' ' {
+			t.Fatalf("address column not filled at %d in %q", addrCol, ln)
+		}
+	}
+
+	// Every server line begins with a single leading space then the name, so
+	// the indented folder members and the top-level row share a name column.
+	for _, ln := range lines {
+		if !strings.HasPrefix(ln, " ") || strings.HasPrefix(ln, "  ▸") {
+			t.Fatalf("unexpected row prefix: %q", ln)
+		}
+	}
+
+	// The connected marker only shows on jump, and its probe is padded so the
+	// marker lands past the probe column; the unconnected rows carry no marker.
+	if !strings.Contains(lines[0], "14.2 ms") || !strings.Contains(lines[0], "● connected") {
+		t.Fatalf("connected row = %q", lines[0])
+	}
+	for _, ln := range lines[1:] {
+		if strings.Contains(ln, "● connected") {
+			t.Fatalf("unexpected marker on %q", ln)
+		}
 	}
 }
 
