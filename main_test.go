@@ -315,6 +315,99 @@ func TestRowBandsSpanFullWidth(t *testing.T) {
 	}
 }
 
+// unreachable only fires on the probes' final verdict, and only while a
+// probe is configured to run at all.
+func TestUnreachable(t *testing.T) {
+	oldCfg := config
+	defer func() { config = oldCfg }()
+	probeMu.Lock()
+	probeText = map[string]string{
+		"dead":    probeUnreachable,
+		"fine":    "14.2 ms",
+		"pending": "pinging…",
+	}
+	probeMu.Unlock()
+
+	config = Config{Ping: true, PingCount: 3}
+	if !unreachable("dead") {
+		t.Fatal("failed probe not reported unreachable")
+	}
+	for _, name := range []string{"fine", "pending", "unknown"} {
+		if unreachable(name) {
+			t.Fatalf("%q reported unreachable", name)
+		}
+	}
+
+	// With every probe off nothing can be called unreachable, whatever a
+	// stale probeText holds.
+	config = Config{PingCount: 3}
+	if unreachable("dead") {
+		t.Fatal("unreachable with probes off")
+	}
+}
+
+// A row given a tint override must wear it across the whole band — under its
+// own text as well as the padding — while the selected row keeps the
+// selection style and the other rows the normal one.
+func TestRowTintPaintsFullRow(t *testing.T) {
+	m := newMacScrollList(tview.NewList().ShowSecondaryText(false), 1)
+	m.setRowStyles(rowStyle, selectedRowStyle)
+	m.SetSelectedFocusOnly(true).SetHighlightFullLine(true)
+	m.SetBackgroundColor(tcell.ColorWhite)
+	m.SetBorderPadding(1, 0, 1, 1)
+	m.SetBorder(true)
+	m.AddItem("selected", "", 0, nil)
+	m.AddItem("dead server", "", 0, nil)
+	m.AddItem("plain", "", 0, nil)
+	m.setRowTint(func(item int) (tcell.Style, bool) {
+		if item == 1 {
+			return unreachableRowStyle, true
+		}
+		return tcell.Style{}, false
+	})
+	m.SetRect(0, 0, 40, 10)
+	m.Focus(nil)
+
+	sc := tcell.NewSimulationScreen("UTF-8")
+	if err := sc.Init(); err != nil {
+		t.Fatal(err)
+	}
+	sc.SetSize(40, 10)
+	m.Draw(sc)
+
+	bgAt := func(x, y int) tcell.Color {
+		_, _, style, _ := sc.GetContent(x, y)
+		_, bg, _ := style.Decompose()
+		return bg
+	}
+	bx, _, bw, _ := m.GetRect()
+	_, iy, _, _ := m.GetInnerRect()
+	for i, want := range []tcell.Style{selectedRowStyle, unreachableRowStyle, rowStyle} {
+		_, wantBg, _ := want.Decompose()
+		for x := bx + 1; x <= bx+bw-2; x++ {
+			if got := bgAt(x, iy+i); got != wantBg {
+				t.Fatalf("row %d col %d bg = %v, want %v", i, x, got, wantBg)
+			}
+		}
+	}
+	// The tinted row's text survives the recolour.
+	var text []rune
+	for x := bx + 2; x < bx+2+len("dead server"); x++ {
+		ch, _, _, _ := sc.GetContent(x, iy+1)
+		text = append(text, ch)
+	}
+	if string(text) != "dead server" {
+		t.Fatalf("tinted row text = %q", string(text))
+	}
+	// Selecting the tinted row swaps it to the selection style.
+	m.SetCurrentItem(1)
+	m.Draw(sc)
+	_, selBg, _ := selectedRowStyle.Decompose()
+	if got := bgAt(bx+1, iy+1); got != selBg {
+		t.Fatalf("selected tinted row bg = %v, want %v", got, selBg)
+	}
+}
+
 func TestParseConfig(t *testing.T) {
 	if c := parseConfig(""); c.Ping || c.PingCount != 3 || c.PortCheck {
 		t.Fatalf("defaults = %+v", c)

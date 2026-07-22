@@ -441,6 +441,10 @@ func isAlive(name string) bool {
 
 // ---------- startup probes (optional, see config.txt) ----------
 
+// probeUnreachable is the probe verdict when every enabled check failed; the
+// row wearing it is tinted with unreachableRowStyle.
+const probeUnreachable = "not reachable"
+
 // portCheckTimeout bounds the TCP probe of the ssh port. It is short on
 // purpose: the probe only runs after a ping already failed, and a server that
 // needs longer than this to answer a SYN is not worth calling reachable.
@@ -503,7 +507,20 @@ func probeServer(s Server) string {
 		}
 		return "port " + s.Port + " open"
 	}
-	return "not reachable"
+	return probeUnreachable
+}
+
+// unreachable reports whether the startup probes have concluded the server
+// cannot be reached: the ping got no answer and — when port_check is on — the
+// ssh port refused too. Always false while the probes are off or still
+// running.
+func unreachable(name string) bool {
+	if !config.Ping && !config.PortCheck {
+		return false
+	}
+	probeMu.Lock()
+	defer probeMu.Unlock()
+	return probeText[name] == probeUnreachable
 }
 
 // pingProbe is the ping leg of probeServer, indirected so tests can drive the
@@ -629,6 +646,13 @@ var (
 	selectedRowStyle = tcell.StyleDefault.
 				Foreground(tcell.ColorWhite).
 				Background(tcell.ColorBlack)
+	// unreachableRowStyle tints a server row whose probes all failed (see
+	// unreachable) a very light red-orange, so dead servers stand out at a
+	// glance without shouting. Terminals without 24-bit colour get tcell's
+	// nearest palette match.
+	unreachableRowStyle = tcell.StyleDefault.
+				Foreground(tcell.ColorBlack).
+				Background(tcell.NewRGBColor(255, 221, 204))
 )
 
 func buildMain() tview.Primitive {
@@ -641,6 +665,18 @@ func buildMain() tview.Primitive {
 	serverList.SetBackgroundColor(tcell.ColorWhite) // Finder-style white pane
 	serverList.SetBorderPadding(1, 0, 1, 1)
 	serverList.SetBorder(true).SetTitle(" Servers ")
+	// A server the probes gave up on wears a light red-orange band. A live
+	// master trumps the probes: connected means reachable, whatever ICMP says.
+	serverList.setRowTint(func(item int) (tcell.Style, bool) {
+		if item >= len(serverRows) {
+			return tcell.Style{}, false
+		}
+		r := serverRows[item]
+		if r.header != "" || isAlive(r.server.Name) || !unreachable(r.server.Name) {
+			return tcell.Style{}, false
+		}
+		return unreachableRowStyle, true
+	})
 	serverList.SetSelectedFunc(func(i int, _, _ string, _ rune) {
 		if i >= len(serverRows) {
 			return
@@ -1195,6 +1231,7 @@ type macScrollList struct {
 	*tview.List
 	lines            int
 	rowStyle, selRow tcell.Style
+	rowTint          func(item int) (tcell.Style, bool)
 }
 
 func newMacScrollList(l *tview.List, linesPerItem int) *macScrollList {
@@ -1208,6 +1245,14 @@ func (m *macScrollList) setRowStyles(normal, selected tcell.Style) {
 	m.rowStyle, m.selRow = normal, selected
 	m.SetMainTextStyle(normal)
 	m.SetSelectedStyle(selected)
+}
+
+// setRowTint registers a per-item override of the normal row style. A tinted
+// row's band is painted in the override and the item's own text is
+// re-backgrounded to match; the selection style still wins on the selected
+// row.
+func (m *macScrollList) setRowTint(f func(item int) (tcell.Style, bool)) {
+	m.rowTint = f
 }
 
 // extendRowBands paints the rest of every item's row in that item's own
@@ -1241,10 +1286,16 @@ func (m *macScrollList) extendRowBands(screen tcell.Screen) {
 			break
 		}
 		style := m.rowStyle
+		tinted := false
+		if m.rowTint != nil {
+			if s, ok := m.rowTint(i); ok {
+				style, tinted = s, true
+			}
+		}
 		// Mirrors List.Draw: with SetSelectedFocusOnly the selected row keeps
 		// the normal background while the pane is unfocused.
 		if i == m.GetCurrentItem() && m.HasFocus() {
-			style = m.selRow
+			style, tinted = m.selRow, false
 		}
 		main, _ := m.GetItemText(i)
 		width := len([]rune(main))
@@ -1259,8 +1310,16 @@ func (m *macScrollList) extendRowBands(screen tcell.Screen) {
 		if end > ix+iw {
 			end = ix + iw
 		}
+		_, tintBg, _ := style.Decompose()
 		for x := left; x <= right; x++ {
 			if x >= ix && x < end {
+				// List.Draw painted the item's text on the normal background;
+				// on a tinted row recolour just the background underneath it,
+				// keeping the glyphs and their attributes.
+				if tinted {
+					ch, comb, st, _ := screen.GetContent(x, row)
+					screen.SetContent(x, row, ch, comb, st.Background(tintBg))
+				}
 				continue
 			}
 			screen.SetContent(x, row, ' ', nil, style)
