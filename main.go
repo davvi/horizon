@@ -27,7 +27,12 @@ const serversFileName = "list_of_servers.txt"
 
 const serversTemplate = `# Horizon servers — one per line:
 #   name  user@host[:port]
+# A [group] line starts a folder; servers below it belong to that group
+# until the next [group] line. Servers above the first group stay at the
+# top level.
 # Example:
+#   jump  ops@jump.example.com
+#   [production]
 #   web1  deploy@203.0.113.10
 #   db    admin@db.internal:2222
 `
@@ -41,7 +46,14 @@ const envTemplate = `# Horizon environment file.
 #   cd /srv/app
 `
 
-type Server struct{ Name, Target, Port string }
+type Server struct{ Name, Target, Port, Group string }
+
+// serverRow is one visible line of the server list: a collapsible group
+// header (Header set) or a server.
+type serverRow struct {
+	header string
+	server Server
+}
 
 // modalEntry is one open dialog; the stack makes dialogs truly modal.
 type modalEntry struct {
@@ -65,6 +77,8 @@ var (
 	serverList *tview.List
 	envList    *tview.List
 	servers    []Server
+	serverRows []serverRow
+	collapsed  = map[string]bool{} // group name -> folded shut
 	pending    *pendingConn
 	modals     []modalEntry
 	focusRing  []tview.Primitive
@@ -167,22 +181,80 @@ func loadServers() []Server {
 		return nil
 	}
 	var out []Server
+	group := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if g, ok := groupHeader(line); ok {
+			group = g
 			continue
 		}
 		f := strings.Fields(line)
 		if len(f) < 2 {
 			continue
 		}
-		s := Server{Name: f[0], Target: f[1], Port: "22"}
+		s := Server{Name: f[0], Target: f[1], Port: "22", Group: group}
 		if host, port, ok := strings.Cut(s.Target, ":"); ok {
 			s.Target, s.Port = host, port
 		}
 		out = append(out, s)
 	}
 	return out
+}
+
+// groupHeader reports whether a trimmed line is a [group] section header
+// and returns the group name.
+func groupHeader(line string) (string, bool) {
+	if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+		return strings.TrimSpace(line[1 : len(line)-1]), true
+	}
+	return "", false
+}
+
+// insertServerLine returns the servers file content with entry added to the
+// given group's section, creating the section if needed. An empty group puts
+// the entry at the top level, i.e. before the first section header.
+func insertServerLine(data, entry, group string) string {
+	lines := strings.Split(data, "\n")
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	insertAt := len(lines)
+	if group == "" {
+		for i, l := range lines {
+			if _, ok := groupHeader(strings.TrimSpace(l)); ok {
+				insertAt = i
+				break
+			}
+		}
+	} else {
+		found := -1
+		for i, l := range lines {
+			if g, ok := groupHeader(strings.TrimSpace(l)); ok && g == group {
+				found = i
+				break
+			}
+		}
+		if found == -1 {
+			lines = append(lines, "["+group+"]")
+			insertAt = len(lines)
+		} else {
+			insertAt = len(lines)
+			for i := found + 1; i < len(lines); i++ {
+				if _, ok := groupHeader(strings.TrimSpace(lines[i])); ok {
+					insertAt = i
+					break
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:insertAt]...)
+	out = append(out, entry)
+	out = append(out, lines[insertAt:]...)
+	return strings.Join(out, "\n") + "\n"
 }
 
 func envFiles() []string {
@@ -308,8 +380,14 @@ func buildMain() tview.Primitive {
 	serverList.SetBorderPadding(1, 0, 1, 1)
 	serverList.SetBorder(true).SetTitle(" Servers ")
 	serverList.SetSelectedFunc(func(i int, _, _ string, _ rune) {
-		if i < len(servers) {
-			selectServer(servers[i])
+		if i >= len(serverRows) {
+			return
+		}
+		if r := serverRows[i]; r.header != "" {
+			collapsed[r.header] = !collapsed[r.header]
+			rebuildServerList()
+		} else {
+			selectServer(r.server)
 		}
 	})
 
@@ -348,7 +426,7 @@ func buildMain() tview.Primitive {
 	bar.AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorWhite), 0, 1, false)
 
 	help := tview.NewTextView().
-		SetText(" Enter: connect   Tab: switch focus   arrows/mouse: navigate").
+		SetText(" Enter: connect / open-close folder   Tab: switch focus   arrows/mouse: navigate").
 		SetTextColor(tcell.ColorDimGray)
 
 	// Split the main area: servers on the left (70%), env files on the right.
@@ -454,20 +532,62 @@ func closeModal() {
 
 func refreshServers() {
 	servers = loadServers()
+	rebuildServerList()
+	refreshEnvList()
+}
+
+// rebuildServerList redraws the server pane: top-level servers first, then
+// each group as a collapsible folder in order of first appearance.
+func rebuildServerList() {
+	cur := serverList.GetCurrentItem()
 	serverList.Clear()
-	// One full-width block line per server; the empty secondary line acts
-	// as spacing between entries.
-	for _, s := range servers {
-		line := fmt.Sprintf(" %-16s %s:%s", s.Name, s.Target, s.Port)
+	serverRows = serverRows[:0]
+
+	addServer := func(s Server, indent string) {
+		serverRows = append(serverRows, serverRow{server: s})
+		line := fmt.Sprintf(" %s%-16s %s:%s", indent, s.Name, s.Target, s.Port)
 		if alive(s) {
 			line += "   [::b]● connected — reusable[::-]"
 		}
 		serverList.AddItem(line, "", 0, nil)
 	}
+
+	var groups []string
+	seen := map[string]bool{}
+	for _, s := range servers {
+		if s.Group == "" {
+			addServer(s, "")
+		} else if !seen[s.Group] {
+			seen[s.Group] = true
+			groups = append(groups, s.Group)
+		}
+	}
+	for _, g := range groups {
+		var members []Server
+		for _, s := range servers {
+			if s.Group == g {
+				members = append(members, s)
+			}
+		}
+		serverRows = append(serverRows, serverRow{header: g})
+		if collapsed[g] {
+			serverList.AddItem(fmt.Sprintf(" ▸ %s (%d)", g, len(members)), "", 0, nil)
+			continue
+		}
+		serverList.AddItem(" ▾ "+g, "", 0, nil)
+		for _, s := range members {
+			addServer(s, "  ")
+		}
+	}
 	if len(servers) == 0 {
 		serverList.AddItem("(no servers yet)", "press n or click New Server to add one", 0, nil)
 	}
-	refreshEnvList()
+	if n := serverList.GetItemCount(); cur >= n {
+		cur = n - 1
+	}
+	if cur >= 0 {
+		serverList.SetCurrentItem(cur)
+	}
 }
 
 func refreshEnvList() {
@@ -573,12 +693,14 @@ func showServerForm() {
 	form := tview.NewForm().
 		AddInputField("Name", "", 30, nil, nil).
 		AddInputField("Target (user@host)", "", 30, nil, nil).
-		AddInputField("Port", "22", 6, nil, nil)
+		AddInputField("Port", "22", 6, nil, nil).
+		AddInputField("Group (optional)", "", 30, nil, nil)
 	styleForm(form)
 	form.AddButton("Save", func() {
 		name := strings.TrimSpace(form.GetFormItemByLabel("Name").(*tview.InputField).GetText())
 		target := strings.TrimSpace(form.GetFormItemByLabel("Target (user@host)").(*tview.InputField).GetText())
 		port := strings.TrimSpace(form.GetFormItemByLabel("Port").(*tview.InputField).GetText())
+		group := strings.TrimSpace(form.GetFormItemByLabel("Group (optional)").(*tview.InputField).GetText())
 		if name == "" || strings.ContainsAny(name, " \t/") {
 			errModal("Name is required and may not contain spaces or slashes.")
 			return
@@ -591,14 +713,22 @@ func showServerForm() {
 			errModal("Port must be a number.")
 			return
 		}
-		f, err := os.OpenFile(filepath.Join(baseDir, serversFileName),
-			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-		if err != nil {
+		if strings.ContainsAny(group, "[]#") {
+			errModal("Group may not contain brackets or #.")
+			return
+		}
+		path := filepath.Join(baseDir, serversFileName)
+		data, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
 			errModal(err.Error())
 			return
 		}
-		fmt.Fprintf(f, "%s %s:%s\n", name, target, port)
-		f.Close()
+		content := insertServerLine(string(data), fmt.Sprintf("%s %s:%s", name, target, port), group)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			errModal(err.Error())
+			return
+		}
+		collapsed[group] = false // make the new entry visible right away
 		closeModal()
 		refreshServers()
 	})
@@ -606,7 +736,7 @@ func showServerForm() {
 	form.SetCancelFunc(closeModal)
 	form.SetBorder(true)
 	form.SetTitle(" New server ")
-	showModal("serverForm", form, 56, 11)
+	showModal("serverForm", form, 56, 13)
 }
 
 func showEnvFileForm() {

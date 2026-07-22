@@ -56,10 +56,61 @@ malformed-line
 	if len(s) != 2 {
 		t.Fatalf("servers = %+v", s)
 	}
-	if s[0] != (Server{"web1", "deploy@203.0.113.10", "22"}) {
+	if s[0] != (Server{"web1", "deploy@203.0.113.10", "22", ""}) {
 		t.Fatalf("s[0] = %+v", s[0])
 	}
-	if s[1] != (Server{"db", "admin@db.internal", "2222"}) {
+	if s[1] != (Server{"db", "admin@db.internal", "2222", ""}) {
 		t.Fatalf("s[1] = %+v", s[1])
+	}
+}
+
+func TestLoadServersGroups(t *testing.T) {
+	baseDir = t.TempDir()
+	os.WriteFile(filepath.Join(baseDir, serversFileName), []byte(`jump ops@jump.example.com
+[production]
+web1 deploy@203.0.113.10
+[ staging ]
+web2 deploy@203.0.113.11:2222
+`), 0o600)
+
+	s := loadServers()
+	if len(s) != 3 {
+		t.Fatalf("servers = %+v", s)
+	}
+	if s[0] != (Server{"jump", "ops@jump.example.com", "22", ""}) {
+		t.Fatalf("s[0] = %+v", s[0])
+	}
+	if s[1] != (Server{"web1", "deploy@203.0.113.10", "22", "production"}) {
+		t.Fatalf("s[1] = %+v", s[1])
+	}
+	if s[2] != (Server{"web2", "deploy@203.0.113.11", "2222", "staging"}) {
+		t.Fatalf("s[2] = %+v", s[2])
+	}
+}
+
+func TestInsertServerLine(t *testing.T) {
+	base := "jump ops@jump.example.com\n[production]\nweb1 deploy@10.0.0.1:22\n[staging]\nweb2 deploy@10.0.0.2:22\n"
+
+	cases := []struct{ name, group, want string }{
+		{"top level goes before first group", "",
+			"jump ops@jump.example.com\nnew u@h:22\n[production]\nweb1 deploy@10.0.0.1:22\n[staging]\nweb2 deploy@10.0.0.2:22\n"},
+		{"existing group extends its section", "production",
+			"jump ops@jump.example.com\n[production]\nweb1 deploy@10.0.0.1:22\nnew u@h:22\n[staging]\nweb2 deploy@10.0.0.2:22\n"},
+		{"last group appends at end", "staging",
+			"jump ops@jump.example.com\n[production]\nweb1 deploy@10.0.0.1:22\n[staging]\nweb2 deploy@10.0.0.2:22\nnew u@h:22\n"},
+		{"new group appended with header", "db",
+			"jump ops@jump.example.com\n[production]\nweb1 deploy@10.0.0.1:22\n[staging]\nweb2 deploy@10.0.0.2:22\n[db]\nnew u@h:22\n"},
+	}
+	for _, c := range cases {
+		if got := insertServerLine(base, "new u@h:22", c.group); got != c.want {
+			t.Errorf("%s:\n got %q\nwant %q", c.name, got, c.want)
+		}
+	}
+
+	if got := insertServerLine("", "new u@h:22", ""); got != "new u@h:22\n" {
+		t.Errorf("empty file: %q", got)
+	}
+	if got := insertServerLine("", "new u@h:22", "prod"); got != "[prod]\nnew u@h:22\n" {
+		t.Errorf("empty file with group: %q", got)
 	}
 }

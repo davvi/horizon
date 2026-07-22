@@ -72,9 +72,14 @@ with `0700`/`0600` permissions.
 
 ### `~/.horizon/list_of_servers.txt`
 
-One server per line — `name user@host[:port]`, `#` for comments:
+One server per line — `name user@host[:port]`, `#` for comments. A `[group]`
+line starts a folder: servers below it belong to that group until the next
+`[group]` line, and show up in the UI as a collapsible folder. Servers above
+the first group stay at the top level.
 
 ```
+jump  ops@jump.example.com
+[production]
 web1  deploy@203.0.113.10
 db    admin@db.internal:2222
 ```
@@ -103,6 +108,7 @@ Everything is clickable with the mouse, and fully usable from the keyboard:
 | Key            | Action                                     |
 | -------------- | ------------------------------------------ |
 | ↑/↓, Enter     | choose a server and connect                |
+| Enter on a folder | open / close the group                  |
 | `n`            | new server form                            |
 | `e`            | new environment file form                  |
 | `r`            | refresh the list and connection statuses   |
