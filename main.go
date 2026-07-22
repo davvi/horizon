@@ -689,12 +689,21 @@ func refreshServers() {
 	refreshEnvList()
 }
 
-// rebuildServerList redraws the server pane: top-level servers first, then
-// each group as a collapsible folder in order of first appearance.
+// rebuildServerList redraws the server pane: servers with a live connection
+// first (hoisted out of their folders so they stay reachable while folders are
+// shut), then the remaining top-level servers, then each group as a
+// collapsible folder in order of first appearance. Groups are folded shut the
+// first time they are seen.
 func rebuildServerList() {
 	cur := serverList.GetCurrentItem()
 	serverList.Clear()
 	serverRows = serverRows[:0]
+
+	// alive() shells out to ssh, so ask once per server per redraw.
+	connected := map[string]bool{}
+	for _, s := range servers {
+		connected[s.Name] = alive(s)
+	}
 
 	addServer := func(s Server, indent string) {
 		serverRows = append(serverRows, serverRow{server: s})
@@ -707,7 +716,7 @@ func rebuildServerList() {
 				line += "   " + p
 			}
 		}
-		if alive(s) {
+		if connected[s.Name] {
 			line += "   [::b]● connected — reusable[::-]"
 		}
 		serverList.AddItem(line, "", 0, nil)
@@ -716,6 +725,14 @@ func rebuildServerList() {
 	var groups []string
 	seen := map[string]bool{}
 	for _, s := range servers {
+		if connected[s.Name] {
+			addServer(s, "")
+		}
+	}
+	for _, s := range servers {
+		if connected[s.Name] {
+			continue
+		}
 		if s.Group == "" {
 			addServer(s, "")
 		} else if !seen[s.Group] {
@@ -726,9 +743,12 @@ func rebuildServerList() {
 	for _, g := range groups {
 		var members []Server
 		for _, s := range servers {
-			if s.Group == g {
+			if s.Group == g && !connected[s.Name] {
 				members = append(members, s)
 			}
+		}
+		if _, known := collapsed[g]; !known {
+			collapsed[g] = true // folders start shut
 		}
 		serverRows = append(serverRows, serverRow{header: g})
 		if collapsed[g] {

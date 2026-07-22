@@ -75,7 +75,8 @@ with `0700`/`0600` permissions.
 One server per line — `name user@host[:port]`, `#` for comments. A `[group]`
 line starts a folder: servers below it belong to that group until the next
 `[group]` line, and show up in the UI as a collapsible folder. Servers above
-the first group stay at the top level.
+the first group stay at the top level. Folders start closed; servers with a
+live reusable connection are listed at the very top, outside their folder.
 
 ```
 jump  ops@jump.example.com
