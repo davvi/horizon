@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
@@ -169,6 +170,58 @@ func TestScrollBarGeometry(t *testing.T) {
 	m.AddItem("item", "", 0, nil)
 	if _, _, _, _, _, ok := m.barGeometry(); !ok {
 		t.Fatal("bar expected for 5 two-line items")
+	}
+}
+
+// Every item's background must run the full width of the pane, from border to
+// border — both the selected row and the rest, whatever their text width — and
+// the border columns themselves must keep the pane's own background.
+func TestRowBandsSpanFullWidth(t *testing.T) {
+	m := newMacScrollList(tview.NewList().ShowSecondaryText(false), 1)
+	m.setRowStyles(rowStyle, selectedRowStyle)
+	m.SetSelectedFocusOnly(true).SetHighlightFullLine(true)
+	m.SetBackgroundColor(tcell.ColorWhite)
+	m.SetBorderPadding(1, 0, 1, 1)
+	m.SetBorder(true)
+	m.AddItem("short", "", 0, nil)
+	m.AddItem("a considerably longer entry", "", 0, nil)
+	m.AddItem("tagged [::b]bold tail[::-]", "", 0, nil)
+	m.SetRect(0, 0, 40, 10)
+	m.Focus(nil) // the selection only paints while the pane has focus
+
+	sc := tcell.NewSimulationScreen("UTF-8")
+	if err := sc.Init(); err != nil {
+		t.Fatal(err)
+	}
+	sc.SetSize(40, 10)
+	m.Draw(sc)
+
+	bgAt := func(x, y int) tcell.Color {
+		_, _, style, _ := sc.GetContent(x, y)
+		_, bg, _ := style.Decompose()
+		return bg
+	}
+	bx, _, bw, _ := m.GetRect()
+	_, iy, _, _ := m.GetInnerRect()
+	// Item 0 is the current one, so it wears the selected background; the rest
+	// wear the normal one.
+	for i, want := range []tcell.Style{selectedRowStyle, rowStyle, rowStyle} {
+		_, wantBg, _ := want.Decompose()
+		y := iy + i
+		for x := bx + 1; x <= bx+bw-2; x++ {
+			if got := bgAt(x, y); got != wantBg {
+				t.Fatalf("row %d col %d bg = %v, want %v", i, x, got, wantBg)
+			}
+		}
+		for _, x := range []int{bx, bx + bw - 1} {
+			if got := bgAt(x, y); got != tcell.ColorWhite {
+				t.Fatalf("row %d border col %d bg = %v, want the pane's white", i, x, got)
+			}
+		}
+	}
+	// Rows past the last item stay plain pane, no band.
+	if got := bgAt(bx+1, iy+3); got != tcell.ColorWhite {
+		t.Fatalf("empty row bg = %v, want the pane's white", got)
 	}
 }
 

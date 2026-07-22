@@ -614,14 +614,26 @@ func connect(s Server, envPath string, reuse bool) {
 
 // ---------- UI ----------
 
+// Row styles for both list panes: black on the Platinum silver, inverted when
+// selected. The silver is stated outright rather than left to the terminal's
+// default background, so a row is the same grey on every terminal — and
+// extendRowBands carries it across the full row, border to border.
+var (
+	rowStyle = tcell.StyleDefault.
+			Foreground(tcell.ColorBlack).
+			Background(tcell.ColorSilver)
+	selectedRowStyle = tcell.StyleDefault.
+				Foreground(tcell.ColorWhite).
+				Background(tcell.ColorBlack)
+)
+
 func buildMain() tview.Primitive {
 	// Each server item is two screen lines (the empty secondary line is the
 	// spacing), env file items are one.
 	serverList = newMacScrollList(tview.NewList(), 2)
-	serverList.SetSelectedTextColor(tcell.ColorWhite).
-		SetSelectedBackgroundColor(tcell.ColorBlack).
-		SetSelectedFocusOnly(true). // no highlight while the pane is unfocused
-		SetHighlightFullLine(true)  // selection spans the whole row, Mac style
+	serverList.setRowStyles(rowStyle, selectedRowStyle)
+	serverList.SetSelectedFocusOnly(true). // no highlight while the pane is unfocused
+						SetHighlightFullLine(true) // selection spans the whole row, Mac style
 	serverList.SetBackgroundColor(tcell.ColorWhite) // Finder-style white pane
 	serverList.SetBorderPadding(1, 0, 1, 1)
 	serverList.SetBorder(true).SetTitle(" Servers ")
@@ -638,9 +650,8 @@ func buildMain() tview.Primitive {
 	})
 
 	envList = newMacScrollList(tview.NewList().ShowSecondaryText(false), 1)
-	envList.SetSelectedTextColor(tcell.ColorWhite).
-		SetSelectedBackgroundColor(tcell.ColorBlack).
-		SetSelectedFocusOnly(true).
+	envList.setRowStyles(rowStyle, selectedRowStyle)
+	envList.SetSelectedFocusOnly(true).
 		SetHighlightFullLine(true)
 	envList.SetBackgroundColor(tcell.ColorWhite)
 	envList.SetBorderPadding(1, 0, 1, 1)
@@ -1150,11 +1161,79 @@ func styleForm(form *tview.Form) {
 // (2 with secondary text, 1 without).
 type macScrollList struct {
 	*tview.List
-	lines int
+	lines            int
+	rowStyle, selRow tcell.Style
 }
 
 func newMacScrollList(l *tview.List, linesPerItem int) *macScrollList {
 	return &macScrollList{List: l, lines: linesPerItem}
+}
+
+// setRowStyles sets how a row is painted, normally and when selected. The
+// styles are kept here as well as on the List so extendRowBands can carry each
+// row's background out to the border.
+func (m *macScrollList) setRowStyles(normal, selected tcell.Style) {
+	m.rowStyle, m.selRow = normal, selected
+	m.SetMainTextStyle(normal)
+	m.SetSelectedStyle(selected)
+}
+
+// extendRowBands paints the rest of every item's row in that item's own
+// background. tview colours only the cells its text actually covers — and for
+// the selected item, out to the inner rect — so a row's band otherwise stops
+// at the end of its text and short of the border padding. Classic Mac lists
+// run their rows edge to edge, so fill from border to border.
+//
+// Called after List.Draw (which clears the whole box first) and before the
+// scroll bar, which owns the right padding column and paints over this.
+func (m *macScrollList) extendRowBands(screen tcell.Screen) {
+	ix, iy, iw, ih := m.GetInnerRect()
+	bx, _, bw, _ := m.GetRect()
+	_, screenH := screen.Size()
+	bottom := iy + ih
+	if bottom > screenH {
+		bottom = screenH
+	}
+	if iw <= 0 || bw < 3 {
+		return
+	}
+	left, right := bx+1, bx+bw-2 // the columns between the two borders
+	useTags, _ := m.GetUseStyleTags()
+	off, hOff := m.GetOffset()
+	if off < 0 {
+		off = 0
+	}
+	for i := off; i < m.GetItemCount(); i++ {
+		row := iy + (i-off)*m.lines
+		if row >= bottom {
+			break
+		}
+		style := m.rowStyle
+		// Mirrors List.Draw: with SetSelectedFocusOnly the selected row keeps
+		// the normal background while the pane is unfocused.
+		if i == m.GetCurrentItem() && m.HasFocus() {
+			style = m.selRow
+		}
+		main, _ := m.GetItemText(i)
+		width := len([]rune(main))
+		if useTags {
+			width = tview.TaggedStringWidth(main)
+		}
+		// First column past the item's own text, which must not be repainted.
+		end := ix + width - hOff
+		if end < ix {
+			end = ix
+		}
+		if end > ix+iw {
+			end = ix + iw
+		}
+		for x := left; x <= right; x++ {
+			if x >= ix && x < end {
+				continue
+			}
+			screen.SetContent(x, row, ' ', nil, style)
+		}
+	}
 }
 
 // barGeometry reports where the scroll bar goes: the column, the top row
@@ -1187,6 +1266,7 @@ func (m *macScrollList) barGeometry() (barX, top, height, thumbTop, thumbH int, 
 
 func (m *macScrollList) Draw(screen tcell.Screen) {
 	m.List.Draw(screen)
+	m.extendRowBands(screen)
 	barX, top, height, thumbTop, thumbH, ok := m.barGeometry()
 	if !ok {
 		return
