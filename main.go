@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -15,6 +16,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -23,7 +26,10 @@ import (
 // version is stamped by the release build (goreleaser) via -ldflags.
 var version = "dev"
 
-const serversFileName = "list_of_servers.txt"
+const (
+	serversFileName = "list_of_servers.txt"
+	configFileName  = "config.txt"
+)
 
 const serversTemplate = `# Horizon servers — one per line:
 #   name  user@host[:port]
@@ -37,6 +43,15 @@ const serversTemplate = `# Horizon servers — one per line:
 #   db    admin@db.internal:2222
 `
 
+const configTemplate = `# Horizon config file — KEY=value lines, # for comments.
+#
+#   ping        on/off — ping every server at startup and show the
+#               average round-trip time on its line (default off)
+#   ping_count  how many pings to send per server (default 3)
+ping=off
+ping_count=3
+`
+
 const envTemplate = `# Horizon environment file.
 # Lines like KEY=value are exported on the server after connecting.
 # Every other non-comment line is executed as a command, in order.
@@ -47,6 +62,12 @@ const envTemplate = `# Horizon environment file.
 `
 
 type Server struct{ Name, Target, Port, Group string }
+
+// Config holds settings read from config.txt in the base folder.
+type Config struct {
+	Ping      bool // ping servers at startup and show the average RTT
+	PingCount int  // pings sent per server
+}
 
 // serverRow is one visible line of the server list: a collapsible group
 // header (Header set) or a server.
@@ -79,6 +100,9 @@ var (
 	servers    []Server
 	serverRows []serverRow
 	collapsed  = map[string]bool{} // group name -> folded shut
+	config     Config
+	pingMu     sync.Mutex
+	pingText   = map[string]string{} // server name -> RTT / "not reachable"
 	pending    *pendingConn
 	modals     []modalEntry
 	focusRing  []tview.Primitive
@@ -100,6 +124,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "horizon:", err)
 		os.Exit(1)
 	}
+	loadConfig()
 
 	// Classic Mac OS "Platinum" look: silver-grey windows, black text and
 	// borders, white fields, black-on-white inverted highlights.
@@ -129,6 +154,7 @@ func main() {
 	pages = tview.NewPages()
 	pages.AddPage("main", buildMain(), true, true)
 	refreshServers()
+	startPings()
 
 	if err := app.SetRoot(pages, true).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "horizon:", err)
@@ -163,10 +189,16 @@ func ensureFiles() error {
 	if err := os.Chmod(baseDir, 0o700); err != nil {
 		return err
 	}
-	sf := filepath.Join(baseDir, serversFileName)
-	if _, err := os.Stat(sf); os.IsNotExist(err) {
-		if err := os.WriteFile(sf, []byte(serversTemplate), 0o600); err != nil {
-			return err
+	templates := map[string]string{
+		serversFileName: serversTemplate,
+		configFileName:  configTemplate,
+	}
+	for name, tmpl := range templates {
+		p := filepath.Join(baseDir, name)
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			if err := os.WriteFile(p, []byte(tmpl), 0o600); err != nil {
+				return err
+			}
 		}
 	}
 	if len(envFiles()) == 0 {
@@ -202,6 +234,37 @@ func loadServers() []Server {
 		out = append(out, s)
 	}
 	return out
+}
+
+// parseConfig reads KEY=value lines; unknown keys and malformed lines are
+// ignored so a hand-edited file can never prevent startup.
+func parseConfig(data string) Config {
+	c := Config{PingCount: 3}
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		switch k {
+		case "ping":
+			c.Ping = v == "on" || v == "true" || v == "yes" || v == "1"
+		case "ping_count":
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				c.PingCount = n
+			}
+		}
+	}
+	return c
+}
+
+func loadConfig() {
+	data, _ := os.ReadFile(filepath.Join(baseDir, configFileName))
+	config = parseConfig(string(data))
 }
 
 // groupHeader reports whether a trimmed line is a [group] section header
@@ -261,7 +324,7 @@ func envFiles() []string {
 	matches, _ := filepath.Glob(filepath.Join(baseDir, "*.txt"))
 	var out []string
 	for _, m := range matches {
-		if filepath.Base(m) != serversFileName {
+		if b := filepath.Base(m); b != serversFileName && b != configFileName {
 			out = append(out, m)
 		}
 	}
@@ -297,6 +360,66 @@ func socketPath(s Server) string {
 
 func alive(s Server) bool {
 	return exec.Command("ssh", "-o", "ControlPath="+socketPath(s), "-O", "check", s.Target).Run() == nil
+}
+
+// ---------- startup pings (optional, see config.txt) ----------
+
+// pingAvgRe matches the summary line of both macOS ("round-trip
+// min/avg/max/stddev = a/b/c/d ms") and Linux ("rtt min/avg/max/mdev = ...")
+// ping output; the second number is the average.
+var pingAvgRe = regexp.MustCompile(`min/avg/max[^=]*= *[0-9.]+/([0-9.]+)/`)
+
+func parsePingAvg(out string) (string, bool) {
+	m := pingAvgRe.FindStringSubmatch(out)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// startPings pings every server concurrently and redraws the list as each
+// result arrives. Does nothing unless ping=on in config.txt.
+func startPings() {
+	if !config.Ping {
+		return
+	}
+	pingMu.Lock()
+	for _, s := range servers {
+		pingText[s.Name] = "pinging…"
+	}
+	pingMu.Unlock()
+	rebuildServerList()
+	for _, s := range servers {
+		s := s
+		go func() {
+			res := pingServer(s)
+			pingMu.Lock()
+			pingText[s.Name] = res
+			pingMu.Unlock()
+			app.QueueUpdateDraw(rebuildServerList)
+		}()
+	}
+}
+
+func pingServer(s Server) string {
+	host := s.Target
+	if _, h, ok := strings.Cut(host, "@"); ok {
+		host = h
+	}
+	// N pings go out one second apart; the margin covers DNS and the last
+	// reply. On timeout or any error the host is reported unreachable.
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(config.PingCount+5)*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ping", "-n", "-q",
+		"-c", strconv.Itoa(config.PingCount), host).Output()
+	if err != nil {
+		return "not reachable"
+	}
+	if avg, ok := parsePingAvg(string(out)); ok {
+		return avg + " ms"
+	}
+	return "not reachable"
 }
 
 func shellQuote(v string) string {
@@ -546,6 +669,14 @@ func rebuildServerList() {
 	addServer := func(s Server, indent string) {
 		serverRows = append(serverRows, serverRow{server: s})
 		line := fmt.Sprintf(" %s%-16s %s:%s", indent, s.Name, s.Target, s.Port)
+		if config.Ping {
+			pingMu.Lock()
+			p := pingText[s.Name]
+			pingMu.Unlock()
+			if p != "" {
+				line += "   " + p
+			}
+		}
 		if alive(s) {
 			line += "   [::b]● connected — reusable[::-]"
 		}

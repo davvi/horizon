@@ -114,3 +114,40 @@ func TestInsertServerLine(t *testing.T) {
 		t.Errorf("empty file with group: %q", got)
 	}
 }
+
+func TestParseConfig(t *testing.T) {
+	if c := parseConfig(""); c.Ping || c.PingCount != 3 {
+		t.Fatalf("defaults = %+v", c)
+	}
+	if c := parseConfig(configTemplate); c.Ping || c.PingCount != 3 {
+		t.Fatalf("template = %+v", c)
+	}
+	c := parseConfig("# comment\nping = on\nping_count = 5\njunk line\nunknown=1\n")
+	if !c.Ping || c.PingCount != 5 {
+		t.Fatalf("parsed = %+v", c)
+	}
+	// Invalid count falls back to the default; ping stays off unless truthy.
+	c = parseConfig("ping=maybe\nping_count=zero\n")
+	if c.Ping || c.PingCount != 3 {
+		t.Fatalf("invalid values = %+v", c)
+	}
+}
+
+func TestParsePingAvg(t *testing.T) {
+	mac := "--- 203.0.113.10 ping statistics ---\n" +
+		"3 packets transmitted, 3 packets received, 0.0% packet loss\n" +
+		"round-trip min/avg/max/stddev = 13.6/14.2/14.9/0.5 ms\n"
+	linux := "--- db.internal ping statistics ---\n" +
+		"3 packets transmitted, 3 received, 0% packet loss, time 2003ms\n" +
+		"rtt min/avg/max/mdev = 20.1/21.0/22.0/0.5 ms\n"
+
+	if avg, ok := parsePingAvg(mac); !ok || avg != "14.2" {
+		t.Fatalf("mac avg = %q %v", avg, ok)
+	}
+	if avg, ok := parsePingAvg(linux); !ok || avg != "21.0" {
+		t.Fatalf("linux avg = %q %v", avg, ok)
+	}
+	if _, ok := parsePingAvg("ping: cannot resolve nope.invalid: Unknown host\n"); ok {
+		t.Fatal("expected no match for error output")
+	}
+}

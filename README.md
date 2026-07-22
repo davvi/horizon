@@ -84,9 +84,25 @@ web1  deploy@203.0.113.10
 db    admin@db.internal:2222
 ```
 
+### `~/.horizon/config.txt`
+
+Horizon's own settings, `KEY=value` lines with `#` comments. Created with
+defaults on first run:
+
+```
+ping=off
+ping_count=3
+```
+
+With `ping=on`, Horizon pings every server once at startup (`ping_count`
+pings each, concurrently) and shows the average round-trip time on the
+server's line — or `not reachable` if the host doesn't answer. It is off by
+default so starting the UI never waits on the network.
+
 ### `~/.horizon/*.txt` — environment files
 
-Every other `.txt` file in the folder is an environment file. Lines like
+Every other `.txt` file in the folder (besides `list_of_servers.txt` and
+`config.txt`) is an environment file. Lines like
 `KEY=value` are exported on the server after connecting; every other
 non-comment line runs as a command, in order. You then land in an interactive
 login shell.
