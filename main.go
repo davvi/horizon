@@ -535,7 +535,8 @@ func buildMain() tview.Primitive {
 	newEnv := tview.NewButton("New Env File (e)").SetSelectedFunc(showEnvFileForm)
 	refresh := tview.NewButton("Refresh (r)").SetSelectedFunc(refreshServers)
 	quit := tview.NewButton("Quit (q)").SetSelectedFunc(app.Stop)
-	for _, b := range []*tview.Button{newSrv, newEnv, refresh, quit} {
+	dup := tview.NewButton("Duplicate (d)").SetSelectedFunc(duplicateCurrentEnv)
+	for _, b := range []*tview.Button{newSrv, newEnv, refresh, quit, dup} {
 		b.SetStyle(tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorBlack))
 		b.SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite))
 	}
@@ -548,7 +549,29 @@ func buildMain() tview.Primitive {
 		b := p.(*tview.Button)
 		bar.AddItem(b, len(b.GetLabel())+2, 0, false)
 	}
+	// The Duplicate item sits collapsed at width 0 until the Env Files pane
+	// is active. Visibility is driven by whoever GAINS focus — hiding on the
+	// env pane's blur would collapse the bar between mouse-down (focus moves
+	// to the button) and mouse-up (the click), making the button unclickable.
+	bar.AddItem(dup, 0, 0, false)
 	bar.AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorWhite), 0, 1, false)
+
+	showDup := func(show bool) {
+		w := 0
+		if show {
+			w = len(dup.GetLabel()) + 2
+		}
+		bar.ResizeItem(dup, w, 0)
+	}
+	envList.SetFocusFunc(func() {
+		envList.SetTitle(" Env Files — d: duplicate ")
+		showDup(true)
+	})
+	envList.SetBlurFunc(func() { envList.SetTitle(" Env Files ") })
+	serverList.SetFocusFunc(func() { showDup(false) })
+	for _, p := range focusRing[2:] {
+		p.(*tview.Button).SetFocusFunc(func() { showDup(false) })
+	}
 
 	help := tview.NewTextView().
 		SetText(" Enter: connect / open-close folder   Tab: switch focus   arrows/mouse: navigate").
@@ -608,6 +631,11 @@ func buildMain() tview.Primitive {
 			case 'e':
 				showEnvFileForm()
 				return nil
+			case 'd':
+				if app.GetFocus() == envList {
+					duplicateCurrentEnv()
+					return nil
+				}
 			case 'r':
 				refreshServers()
 				return nil
@@ -737,11 +765,13 @@ func refreshEnvList() {
 func selectEnvFile(path string) {
 	dialog("envAction",
 		fmt.Sprintf("“%s”", filepath.Base(path)),
-		[]string{"Edit", "Delete", "Cancel"},
+		[]string{"Edit", "Duplicate", "Delete", "Cancel"},
 		func(label string) {
 			switch label {
 			case "Edit":
 				showEnvEditForm(path)
+			case "Duplicate":
+				newEnvFileForm(path)
 			case "Delete":
 				dialog("envDelete",
 					fmt.Sprintf("Delete “%s”?\nThis cannot be undone.", filepath.Base(path)),
@@ -872,20 +902,51 @@ func showServerForm() {
 	showModal("serverForm", form, 56, 13)
 }
 
-func showEnvFileForm() {
+func showEnvFileForm() { newEnvFileForm("") }
+
+// duplicateCurrentEnv opens the new-file form prefilled with the env file
+// highlighted in the env pane ("d" key or the bar's Duplicate button).
+func duplicateCurrentEnv() {
+	files := envFiles()
+	if i := envList.GetCurrentItem(); i >= 0 && i < len(files) {
+		newEnvFileForm(files[i])
+	}
+}
+
+// newEnvFileForm opens the New-env-file dialog. A non-empty copyPath (the
+// Duplicate flow: "d" on a highlighted env file, or the Duplicate button)
+// prefills the form with that file's content and a name for the copy.
+func newEnvFileForm(copyPath string) {
+	name, content := "", envTemplate
+	title := " New env file "
+	if copyPath != "" {
+		data, err := os.ReadFile(copyPath)
+		if err != nil {
+			errModal(err.Error())
+			return
+		}
+		content = string(data)
+		name = strings.TrimSuffix(filepath.Base(copyPath), ".txt") + "_copy"
+		title = fmt.Sprintf(" New env file (copy of %s) ", filepath.Base(copyPath))
+	}
+
 	form := tview.NewForm().
-		AddInputField("File name", "", 30, nil, nil).
-		AddTextArea("Content", envTemplate, 60, 8, 0, nil)
+		AddInputField("File name", name, 30, nil, nil).
+		AddTextArea("Content", content, 60, 8, 0, nil)
 	styleForm(form)
 	form.AddButton("Save", func() {
 		name := strings.TrimSpace(form.GetFormItemByLabel("File name").(*tview.InputField).GetText())
 		name = filepath.Base(name) // keep it inside baseDir
-		if name == "" || name == "." || name == serversFileName {
+		if name == "" || name == "." || name == serversFileName || name == configFileName {
 			errModal("Please enter a valid file name.")
 			return
 		}
 		if !strings.HasSuffix(name, ".txt") {
 			name += ".txt"
+		}
+		if _, err := os.Stat(filepath.Join(baseDir, name)); err == nil {
+			errModal(fmt.Sprintf("“%s” already exists.\nPick another name, or use Edit to change it.", name))
+			return
 		}
 		content := form.GetFormItemByLabel("Content").(*tview.TextArea).GetText()
 		if err := os.WriteFile(filepath.Join(baseDir, name), []byte(content), 0o600); err != nil {
@@ -898,7 +959,7 @@ func showEnvFileForm() {
 	form.AddButton("Cancel", closeModal)
 	form.SetCancelFunc(closeModal)
 	form.SetBorder(true)
-	form.SetTitle(" New env file ")
+	form.SetTitle(title)
 	// 8-line text area + file-name row + buttons + form padding + border.
 	showModal("envForm", form, 76, 16)
 }

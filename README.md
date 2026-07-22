@@ -132,7 +132,14 @@ a page, or just use the mouse wheel and arrow keys.
 | `e`            | new environment file form                  |
 | `r`            | refresh the list and connection statuses   |
 | `q`            | quit (live connections keep running)       |
+| `d`            | duplicate the selected env file            |
 | Tab / Esc      | move focus / close a dialog                |
+
+With the Env Files pane focused, a **Duplicate (d)** button appears in the
+top bar; it, the `d` key, or the **Duplicate** option after clicking a file
+all open the new-file form prefilled with the selected file's content and a
+suggested `<name>_copy` name — edit and save it as a new file. Saving never
+overwrites an existing file — pick a new name or use **Edit**.
 
 Connecting to a server that already has a live connection pops up a choice:
 **Reuse** opens a new session over the existing connection instantly (no
