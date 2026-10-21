@@ -5,10 +5,9 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/davvi/horizon.svg)](https://pkg.go.dev/github.com/davvi/horizon)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A small terminal UI for managing SSH connections on macOS and Linux. Pick a
-server, pick an environment file, and Horizon connects you with your variables
-exported and your setup commands already run. Connections are kept alive in the
-background and reused instantly.
+A small terminal UI for managing SSH connections on macOS and Linux. Keep your
+servers in folders, pick one, and Horizon connects you. Connections are kept
+alive in the background and reused instantly.
 
 Horizon is deliberately tiny: the UI is [tview](https://github.com/rivo/tview),
 and all SSH work is done by your system's own OpenSSH client using
@@ -111,20 +110,6 @@ exchange or login attempt is logged on the far side. This is also off by
 default, and works on its own with `ping=off` (the line then reads
 `port 22 open`).
 
-### `~/.horizon/*.txt` — environment files
-
-Every other `.txt` file in the folder (besides `list_of_servers.txt` and
-`config.txt`) is an environment file. Lines like
-`KEY=value` are exported on the server after connecting; every other
-non-comment line runs as a command, in order. You then land in an interactive
-login shell.
-
-```
-APP_ENV=staging
-DB_URL=postgres://app@db/main
-cd /srv/app
-```
-
 ### `~/.horizon/sockets/`
 
 ControlMaster sockets for live connections. Managed automatically.
@@ -138,25 +123,31 @@ a page, or just use the mouse wheel and arrow keys.
 
 | Key            | Action                                     |
 | -------------- | ------------------------------------------ |
-| ↑/↓, Enter     | choose a server and connect                |
-| Enter on a folder | open / close the group                  |
+| ↑/↓, Enter     | choose a server and open its menu          |
+| Enter on a folder | open / close the folder                 |
 | `n`            | new server form                            |
-| `e`            | new environment file form                  |
+| `f`            | new folder                                 |
 | `r`            | refresh the list and connection statuses   |
 | `q`            | quit (live connections keep running)       |
-| `d`            | duplicate the selected env file            |
-| Tab / Esc      | move focus / close a dialog                |
+| Tab / Esc      | move focus / close a dialog or menu        |
 
-With the Env Files pane focused, a **Duplicate (d)** button appears in the
-top bar; it, the `d` key, or the **Duplicate** option after clicking a file
-all open the new-file form prefilled with the selected file's content and a
-suggested `<name>_copy` name — edit and save it as a new file. Saving never
-overwrites an existing file — pick a new name or use **Edit**.
+Clicking a server, or pressing Enter on it, pops up a small menu under the
+row: **Connect** (`c`), **Edit…** (`e`) and **Delete…** (`d`). **Edit** opens
+a form with every setting of the host — name, user, host, port and folder —
+and saves it back to `list_of_servers.txt` in place, comments and all. Moving
+a server to another folder moves its line into that folder's section.
+Renaming a server, or changing its address, and deleting it each stop the old
+background connection from taking new sessions (sessions already open over it
+keep running).
+
+**New Folder** (`f`) adds an empty `[folder]` section to the end of
+`list_of_servers.txt`; it shows up in the list straight away, ready for
+servers to be created in it or moved into it with **Edit**.
 
 Connecting to a server that already has a live connection pops up a choice:
 **Reuse** opens a new session over the existing connection instantly (no
-re-authentication); **New connection** closes the old one, lets you pick an
-environment file, and reconnects fresh.
+re-authentication); **New connection** closes the old one and reconnects
+fresh.
 
 When you pick a server, Horizon's UI closes and hands your terminal directly to
 `ssh` — typing `exit` on the remote host drops you straight back into the local

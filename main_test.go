@@ -11,61 +11,6 @@ import (
 	"github.com/rivo/tview"
 )
 
-func TestParseEnvFileAndScript(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "env.txt")
-	os.WriteFile(p, []byte(`# comment
-APP_ENV=staging
-GREETING=it's a 'test'
-
-cd /srv/app
-echo ready
-`), 0o600)
-
-	vars, cmds, err := parseEnvFile(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(vars) != 2 || vars[0] != "APP_ENV=staging" {
-		t.Fatalf("vars = %q", vars)
-	}
-	if len(cmds) != 2 || cmds[0] != "cd /srv/app" {
-		t.Fatalf("cmds = %q", cmds)
-	}
-
-	got := buildScript(vars, cmds)
-	want := strings.Join([]string{
-		`export APP_ENV='staging'`,
-		`export GREETING='it'\''s a '\''test'\'''`,
-		`cd /srv/app`,
-		`echo ready`,
-		`printf '\n== Horizon: environment applied ==\n'`,
-		`printf 'Variables set:\n'`,
-		`printf '  %s=%s\n' 'APP_ENV' "$APP_ENV"`,
-		`printf '  %s=%s\n' 'GREETING' "$GREETING"`,
-		`printf 'Commands run:\n'`,
-		`printf '  %s\n' 'cd /srv/app'`,
-		`printf '  %s\n' 'echo ready'`,
-		`printf '\n'`,
-		`exec "$SHELL" -l`,
-	}, "\n")
-	if got != want {
-		t.Fatalf("script:\n got %s\nwant %s", got, want)
-	}
-}
-
-// A user command carrying an inline "#" comment (or a trailing "&") must not
-// swallow the rest of the script: each part sits on its own line, so the
-// final exec of the login shell always survives.
-func TestBuildScriptSurvivesInlineComment(t *testing.T) {
-	got := buildScript(nil, []string{"echo hi  # just saying hi"})
-	if !strings.HasSuffix(got, "\nexec \"$SHELL\" -l") {
-		t.Fatalf("login-shell exec lost after inline comment:\n%s", got)
-	}
-	if strings.Contains(got, "; ") {
-		t.Fatalf("script joined with semicolons:\n%s", got)
-	}
-}
-
 func TestLoadServers(t *testing.T) {
 	baseDir = t.TempDir()
 	os.WriteFile(filepath.Join(baseDir, serversFileName), []byte(`# comment
@@ -74,7 +19,7 @@ db   admin@db.internal:2222
 malformed-line
 `), 0o600)
 
-	s := loadServers()
+	s, _ := loadServers()
 	if len(s) != 2 {
 		t.Fatalf("servers = %+v", s)
 	}
@@ -95,7 +40,7 @@ web1 deploy@203.0.113.10
 web2 deploy@203.0.113.11:2222
 `), 0o600)
 
-	s := loadServers()
+	s, _ := loadServers()
 	if len(s) != 3 {
 		t.Fatalf("servers = %+v", s)
 	}
@@ -107,6 +52,26 @@ web2 deploy@203.0.113.11:2222
 	}
 	if s[2] != (Server{"web2", "deploy@203.0.113.11", "2222", "staging"}) {
 		t.Fatalf("s[2] = %+v", s[2])
+	}
+}
+
+// A folder header with nothing under it is still a folder, and a header
+// repeated later in the file doesn't list the folder twice.
+func TestLoadServersEmptyGroups(t *testing.T) {
+	baseDir = t.TempDir()
+	os.WriteFile(filepath.Join(baseDir, serversFileName), []byte(`[empty]
+[production]
+web1 deploy@203.0.113.10
+[production]
+web2 deploy@203.0.113.11
+`), 0o600)
+
+	s, g := loadServers()
+	if len(s) != 2 || s[1].Group != "production" {
+		t.Fatalf("servers = %+v", s)
+	}
+	if strings.Join(g, ",") != "empty,production" {
+		t.Fatalf("groups = %q", g)
 	}
 }
 
@@ -145,7 +110,7 @@ func TestServerRowColumnsAlign(t *testing.T) {
 	app = tview.NewApplication()
 	pages = tview.NewPages()
 	buildMain()
-	servers = loadServers()
+	servers, groups = loadServers()
 	collapsed["production"] = false
 
 	aliveMu.Lock()
@@ -212,7 +177,7 @@ badtarget -oProxyCommand=payload
 badport deploy@203.0.113.15:-1
 `), 0o600)
 
-	s := loadServers()
+	s, _ := loadServers()
 	if len(s) != 1 {
 		t.Fatalf("servers = %+v", s)
 	}
@@ -271,6 +236,55 @@ func TestInsertServerLine(t *testing.T) {
 	}
 	if got := insertServerLine("", "new u@h:22", "prod"); got != "[prod]\nnew u@h:22\n" {
 		t.Errorf("empty file with group: %q", got)
+	}
+}
+
+func TestReplaceServerLine(t *testing.T) {
+	base := "# web1 old@comment\njump ops@jump.example.com\n[production]\n  web1 deploy@10.0.0.1:22\nweb2 deploy@10.0.0.2:22\n"
+
+	got := replaceServerLine(base, "web1", "web1 root@10.0.0.9:2222")
+	want := "# web1 old@comment\njump ops@jump.example.com\n[production]\nweb1 root@10.0.0.9:2222\nweb2 deploy@10.0.0.2:22\n"
+	if got != want {
+		t.Errorf("replace:\n got %q\nwant %q", got, want)
+	}
+
+	got = replaceServerLine(base, "web1", "")
+	want = "# web1 old@comment\njump ops@jump.example.com\n[production]\nweb2 deploy@10.0.0.2:22\n"
+	if got != want {
+		t.Errorf("delete:\n got %q\nwant %q", got, want)
+	}
+
+	if got := replaceServerLine(base, "missing", ""); got != base {
+		t.Errorf("unknown name changed the file: %q", got)
+	}
+
+	// The line loadServers would drop for an unsafe target is not the one
+	// edited; the valid duplicate after it is.
+	dup := "ok -oProxyCommand=x\nok deploy@10.0.0.1\n"
+	if got := replaceServerLine(dup, "ok", ""); got != "ok -oProxyCommand=x\n" {
+		t.Errorf("unsafe duplicate: %q", got)
+	}
+}
+
+func TestAppendGroup(t *testing.T) {
+	if got := appendGroup("jump ops@jump\n\n\n", "db"); got != "jump ops@jump\n[db]\n" {
+		t.Errorf("append = %q", got)
+	}
+	if got := appendGroup("", "db"); got != "[db]\n" {
+		t.Errorf("empty file = %q", got)
+	}
+}
+
+func TestValidGroup(t *testing.T) {
+	for _, g := range []string{"prod", "eu west", "db-1"} {
+		if !validGroup(g) {
+			t.Errorf("validGroup(%q) = false", g)
+		}
+	}
+	for _, g := range []string{"", " prod", "a]b", "[x", "a#b"} {
+		if validGroup(g) {
+			t.Errorf("validGroup(%q) = true", g)
+		}
 	}
 }
 

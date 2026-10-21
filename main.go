@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,15 +61,6 @@ ping_count=3
 port_check=off
 `
 
-const envTemplate = `# Horizon environment file.
-# Lines like KEY=value are exported on the server after connecting.
-# Every other non-comment line is executed as a command, in order.
-# Afterwards you are dropped into an interactive login shell.
-# Example:
-#   APP_ENV=staging
-#   cd /srv/app
-`
-
 type Server struct{ Name, Target, Port, Group string }
 
 // Config holds settings read from config.txt in the base folder.
@@ -91,6 +81,8 @@ type serverRow struct {
 type modalEntry struct {
 	name string
 	prim tview.Primitive
+	drop *tview.DropDown // a picker in the dialog that may hang outside it
+	menu bool            // a pop-up menu: a click outside dismisses it
 }
 
 // pendingConn is an ssh session to start after the TUI has fully shut down,
@@ -107,8 +99,8 @@ var (
 	app        *tview.Application
 	pages      *tview.Pages
 	serverList *macScrollList
-	envList    *macScrollList
 	servers    []Server
+	groups     []string // folder names, in file order
 	serverRows []serverRow
 	collapsed  = map[string]bool{} // group name -> folded shut
 	config     Config
@@ -120,7 +112,6 @@ var (
 	pending    *pendingConn
 	modals     []modalEntry
 	focusRing  []tview.Primitive
-	envVarRe   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 )
 
 func main() {
@@ -243,20 +234,22 @@ func ensureFiles() error {
 			}
 		}
 	}
-	if len(envFiles()) == 0 {
-		return os.WriteFile(filepath.Join(baseDir, "example_env.txt"), []byte(envTemplate), 0o600)
-	}
 	return nil
 }
 
-func loadServers() []Server {
+// loadServers reads the servers file and returns its servers and its folders.
+// Folders are every [group] header, in order of first appearance, so a folder
+// with no servers in it yet still shows up.
+func loadServers() ([]Server, []string) {
 	data, err := os.ReadFile(filepath.Join(baseDir, serversFileName))
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	var out []Server
+	var groups []string
 	group := ""
 	seen := map[string]bool{}
+	seenGroup := map[string]bool{}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -264,27 +257,40 @@ func loadServers() []Server {
 		}
 		if g, ok := groupHeader(line); ok {
 			group = g
+			if g != "" && !seenGroup[g] {
+				seenGroup[g] = true
+				groups = append(groups, g)
+			}
 			continue
 		}
-		f := strings.Fields(line)
-		if len(f) < 2 {
+		s, ok := parseServerLine(line)
+		if !ok || seen[s.Name] {
 			continue
 		}
-		s := Server{Name: f[0], Target: f[1], Port: "22", Group: group}
-		if host, port, ok := strings.Cut(s.Target, ":"); ok {
-			s.Target, s.Port = host, port
-		}
-		// The name doubles as the socket file name and the key of every
-		// per-server map, and target/port become ssh arguments; drop entries
-		// a hand-edit made unsafe or ambiguous rather than let them through.
-		if !validName(s.Name) || seen[s.Name] ||
-			strings.HasPrefix(s.Target, "-") || strings.HasPrefix(s.Port, "-") {
-			continue
-		}
+		s.Group = group
 		seen[s.Name] = true
 		out = append(out, s)
 	}
-	return out
+	return out, groups
+}
+
+// parseServerLine parses one trimmed "name user@host[:port]" line. The name
+// doubles as the socket file name and the key of every per-server map, and
+// target/port become ssh arguments; entries a hand-edit made unsafe are
+// rejected rather than let through.
+func parseServerLine(line string) (Server, bool) {
+	f := strings.Fields(line)
+	if len(f) < 2 {
+		return Server{}, false
+	}
+	s := Server{Name: f[0], Target: f[1], Port: "22"}
+	if host, port, ok := strings.Cut(s.Target, ":"); ok {
+		s.Target, s.Port = host, port
+	}
+	if !validName(s.Name) || strings.HasPrefix(s.Target, "-") || strings.HasPrefix(s.Port, "-") {
+		return Server{}, false
+	}
+	return s, true
 }
 
 // validName reports whether a server name is safe to use as a map key and as
@@ -397,36 +403,46 @@ func insertServerLine(data, entry, group string) string {
 	return strings.Join(out, "\n") + "\n"
 }
 
-func envFiles() []string {
-	matches, _ := filepath.Glob(filepath.Join(baseDir, "*.txt"))
-	var out []string
-	for _, m := range matches {
-		if b := filepath.Base(m); b != serversFileName && b != configFileName {
-			out = append(out, m)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-// parseEnvFile splits a txt file into exported variables and commands.
-func parseEnvFile(path string) (vars, cmds []string, err error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+// replaceServerLine returns the servers file content with the line for the
+// named server swapped for entry, or removed when entry is empty. Only the
+// line loadServers would use counts — the first valid one with that name — and
+// every other line, comments included, is left exactly as it was.
+func replaceServerLine(data, name, entry string) string {
+	lines := strings.Split(data, "\n")
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "#") {
 			continue
 		}
-		if envVarRe.MatchString(line) {
-			vars = append(vars, line)
-		} else {
-			cmds = append(cmds, line)
+		if _, ok := groupHeader(t); ok {
+			continue
 		}
+		if s, ok := parseServerLine(t); !ok || s.Name != name {
+			continue
+		}
+		if entry == "" {
+			return strings.Join(append(lines[:i:i], lines[i+1:]...), "\n")
+		}
+		lines[i] = entry
+		break
 	}
-	return vars, cmds, nil
+	return strings.Join(lines, "\n")
+}
+
+// appendGroup returns the servers file content with an empty [group] section
+// added at the end.
+func appendGroup(data, group string) string {
+	data = strings.TrimRight(data, " \t\n")
+	if data != "" {
+		data += "\n"
+	}
+	return data + "[" + group + "]\n"
+}
+
+// validGroup reports whether a folder name survives a round trip through a
+// [group] header line.
+func validGroup(g string) bool {
+	return g != "" && g == strings.TrimSpace(g) && !strings.ContainsAny(g, "[]#\n")
 }
 
 // ---------- ssh via system OpenSSH (ControlMaster keeps connections alive) ----------
@@ -479,6 +495,18 @@ func refreshAlive(list []Server) {
 			}
 		}()
 	}
+}
+
+// stopMaster asks a server's master to stop accepting new sessions. Unlike
+// "-O exit" it leaves sessions already running over it alone; the master goes
+// away once the last of them ends. Used when a server is deleted or its
+// address changes, so the old master is neither orphaned nor reused for the
+// wrong host.
+func stopMaster(s Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), aliveTimeout)
+	defer cancel()
+	exec.CommandContext(ctx, "ssh",
+		"-o", "ControlPath="+socketPath(s), "-O", "stop", "--", s.Target).Run()
 }
 
 func isAlive(name string) bool {
@@ -626,70 +654,16 @@ func hostOf(target string) string {
 	return target
 }
 
-func shellQuote(v string) string {
-	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
-}
-
-func buildScript(vars, cmds []string) string {
-	var parts []string
-	for _, v := range vars {
-		k, val, _ := strings.Cut(v, "=")
-		parts = append(parts, "export "+k+"="+shellQuote(val))
-	}
-	parts = append(parts, cmds...)
-	// Once the connection is up and the environment is applied, show the user
-	// what Horizon did on the remote host: every variable with the value it
-	// now holds, and each command that ran, before handing over the shell.
-	parts = append(parts, buildReport(vars, cmds)...)
-	parts = append(parts, `exec "$SHELL" -l`)
-	// One command per line: the whole script travels as a single ssh argument,
-	// and newlines keep a user command's inline "#" comment or trailing "&"
-	// from eating the commands that follow it, as a "; " join would.
-	return strings.Join(parts, "\n")
-}
-
-// buildReport emits shell snippets that print a summary of the applied
-// environment. Variable values are read back with "$NAME" so they reflect
-// what was actually set on the server, not just the file's text.
-func buildReport(vars, cmds []string) []string {
-	if len(vars) == 0 && len(cmds) == 0 {
-		return nil
-	}
-	out := []string{`printf '\n== Horizon: environment applied ==\n'`}
-	if len(vars) > 0 {
-		out = append(out, `printf 'Variables set:\n'`)
-		for _, v := range vars {
-			k, _, _ := strings.Cut(v, "=")
-			out = append(out, `printf '  %s=%s\n' `+shellQuote(k)+` "$`+k+`"`)
-		}
-	}
-	if len(cmds) > 0 {
-		out = append(out, `printf 'Commands run:\n'`)
-		for _, c := range cmds {
-			out = append(out, `printf '  %s\n' `+shellQuote(c))
-		}
-	}
-	return append(out, `printf '\n'`)
-}
-
 // connect closes the TUI and queues the ssh session; main runs it once the
 // terminal is restored, so exiting ssh drops back to the original local shell.
 // With reuse=false any stale master is torn down and a fresh one is created.
-func connect(s Server, envPath string, reuse bool) {
+func connect(s Server, reuse bool) {
 	sock := socketPath(s)
 	args := []string{
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath=" + sock,
 		"-o", "ControlPersist=yes",
 		"-p", s.Port, "-t", "--", s.Target,
-	}
-	if !reuse && envPath != "" {
-		vars, cmds, err := parseEnvFile(envPath)
-		if err != nil {
-			errModal(err.Error())
-			return
-		}
-		args = append(args, buildScript(vars, cmds))
 	}
 	pending = &pendingConn{name: s.Name, target: s.Target, args: args}
 	if !reuse {
@@ -721,8 +695,8 @@ var (
 )
 
 func buildMain() tview.Primitive {
-	// Each server item is two screen lines (the empty secondary line is the
-	// spacing), env file items are one.
+	// Each server item is two screen lines; the empty secondary line is the
+	// spacing.
 	serverList = newMacScrollList(tview.NewList(), 2)
 	serverList.setRowStyles(rowStyle, selectedRowStyle)
 	serverList.SetSelectedFocusOnly(true). // no highlight while the pane is unfocused
@@ -750,82 +724,45 @@ func buildMain() tview.Primitive {
 			collapsed[r.header] = !collapsed[r.header]
 			rebuildServerList()
 		} else {
-			selectServer(r.server)
-		}
-	})
-
-	envList = newMacScrollList(tview.NewList().ShowSecondaryText(false), 1)
-	envList.setRowStyles(rowStyle, selectedRowStyle)
-	envList.SetSelectedFocusOnly(true).
-		SetHighlightFullLine(true)
-	envList.SetBackgroundColor(tcell.ColorWhite)
-	envList.SetBorderPadding(1, 0, 1, 1)
-	envList.SetBorder(true).SetTitle(" Env Files ")
-	envList.SetSelectedFunc(func(i int, _, _ string, _ rune) {
-		files := envFiles()
-		if i < len(files) {
-			selectEnvFile(files[i])
+			showServerMenu(r.server)
 		}
 	})
 
 	newSrv := tview.NewButton("New Server (n)").SetSelectedFunc(showServerForm)
-	newEnv := tview.NewButton("New Env File (e)").SetSelectedFunc(showEnvFileForm)
+	newFolder := tview.NewButton("New Folder (f)").SetSelectedFunc(showFolderForm)
 	refresh := tview.NewButton("Refresh (r)").SetSelectedFunc(refreshServers)
 	quit := tview.NewButton("Quit (q)").SetSelectedFunc(app.Stop)
-	dup := tview.NewButton("Duplicate (d)").SetSelectedFunc(duplicateCurrentEnv)
-	for _, b := range []*tview.Button{newSrv, newEnv, refresh, quit, dup} {
+	for _, b := range []*tview.Button{newSrv, newFolder, refresh, quit} {
 		b.SetStyle(tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorBlack))
 		b.SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite))
 	}
-	focusRing = []tview.Primitive{serverList, envList, newSrv, newEnv, refresh, quit}
+	focusRing = []tview.Primitive{serverList, newSrv, newFolder, refresh, quit}
 
 	// White strip across the top with flat items, like the classic menu bar.
 	bar := tview.NewFlex()
 	bar.AddItem(tview.NewTextView().SetText(" ⌘").SetBackgroundColor(tcell.ColorWhite), 3, 0, false)
-	for _, p := range focusRing[2:] {
+	for _, p := range focusRing[1:] {
 		b := p.(*tview.Button)
 		bar.AddItem(b, len(b.GetLabel())+2, 0, false)
 	}
-	// The Duplicate item sits collapsed at width 0 until the Env Files pane
-	// is active. Visibility is driven by whoever GAINS focus — hiding on the
-	// env pane's blur would collapse the bar between mouse-down (focus moves
-	// to the button) and mouse-up (the click), making the button unclickable.
-	bar.AddItem(dup, 0, 0, false)
 	bar.AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorWhite), 0, 1, false)
 
-	showDup := func(show bool) {
-		w := 0
-		if show {
-			w = len(dup.GetLabel()) + 2
-		}
-		bar.ResizeItem(dup, w, 0)
-	}
-	envList.SetFocusFunc(func() {
-		envList.SetTitle(" Env Files — d: duplicate ")
-		showDup(true)
-	})
-	envList.SetBlurFunc(func() { envList.SetTitle(" Env Files ") })
-	serverList.SetFocusFunc(func() { showDup(false) })
-	for _, p := range focusRing[2:] {
-		p.(*tview.Button).SetFocusFunc(func() { showDup(false) })
-	}
-
 	help := tview.NewTextView().
-		SetText(" Enter: connect / open-close folder   Tab: switch focus   arrows/mouse: navigate").
+		SetText(" Enter: server menu / open-close folder   Tab: switch focus   arrows/mouse: navigate").
 		SetTextColor(tcell.ColorDimGray)
-
-	// Split the main area: servers on the left (70%), env files on the right.
-	split := tview.NewFlex().
-		AddItem(serverList, 0, 7, true).
-		AddItem(envList, 0, 3, false)
 
 	root := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(bar, 1, 0, false).
-		AddItem(split, 0, 1, true).
+		AddItem(serverList, 0, 1, true).
 		AddItem(help, 1, 0, false)
 
 	app.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
 		if len(modals) > 0 {
+			// An open folder picker gets the key first, so Esc closes just
+			// the picker and not the whole form.
+			if d := modals[len(modals)-1].drop; d != nil && d.IsOpen() {
+				return e
+			}
 			// Esc always closes the top dialog, wherever focus is.
 			if e.Key() == tcell.KeyEscape {
 				closeModal()
@@ -860,19 +797,14 @@ func buildMain() tview.Primitive {
 			app.SetFocus(focusRing[(cur+step)%len(focusRing)])
 			return nil
 		}
-		if app.GetFocus() == serverList || app.GetFocus() == envList {
+		if app.GetFocus() == serverList {
 			switch e.Rune() {
 			case 'n':
 				showServerForm()
 				return nil
-			case 'e':
-				showEnvFileForm()
+			case 'f':
+				showFolderForm()
 				return nil
-			case 'd':
-				if app.GetFocus() == envList {
-					duplicateCurrentEnv()
-					return nil
-				}
 			case 'r':
 				refreshServers()
 				return nil
@@ -884,14 +816,23 @@ func buildMain() tview.Primitive {
 		return e
 	})
 	// While a dialog is open, swallow mouse events outside it so nothing
-	// behind can be clicked.
+	// behind can be clicked. An open folder picker may hang past the bottom of
+	// its form, so it gets every event until it closes.
 	app.SetMouseCapture(func(ev *tcell.EventMouse, act tview.MouseAction) (*tcell.EventMouse, tview.MouseAction) {
 		if len(modals) == 0 {
 			return ev, act
 		}
-		x, y, w, h := modals[len(modals)-1].prim.GetRect()
+		top := modals[len(modals)-1]
+		if top.drop != nil && top.drop.IsOpen() {
+			return ev, act
+		}
+		x, y, w, h := top.prim.GetRect()
 		mx, my := ev.Position()
 		if mx < x || mx >= x+w || my < y || my >= y+h {
+			// A click outside a popup menu dismisses it, like a real menu.
+			if top.menu && act == tview.MouseLeftDown {
+				closeModal()
+			}
 			return nil, 0
 		}
 		return ev, act
@@ -901,7 +842,7 @@ func buildMain() tview.Primitive {
 
 // showModal opens p as a centered dialog on top of everything else.
 func showModal(name string, p tview.Primitive, w, h int) {
-	modals = append(modals, modalEntry{name, p})
+	modals = append(modals, modalEntry{name: name, prim: p})
 	pages.AddPage(name, center(p, w, h), true, true)
 }
 
@@ -920,12 +861,11 @@ func closeModal() {
 	}
 }
 
-// refreshData redraws both panes straight from the text files. It touches
-// nothing but local disk, so it is safe on the path to the first frame.
+// refreshData redraws the server pane straight from the text files. It
+// touches nothing but local disk, so it is safe on the path to the first frame.
 func refreshData() {
-	servers = loadServers()
+	servers, groups = loadServers()
 	rebuildServerList()
-	refreshEnvList()
 }
 
 func refreshServers() {
@@ -937,8 +877,8 @@ func refreshServers() {
 
 // rebuildServerList redraws the server pane: servers with a live connection
 // first (hoisted out of their folders so they stay reachable while folders are
-// shut), then the remaining top-level servers, then each group as a
-// collapsible folder in order of first appearance. Groups are folded shut the
+// shut), then the remaining top-level servers, then each folder, collapsible,
+// in the order its header appears in the file. Folders are folded shut the
 // first time they are seen.
 func rebuildServerList() {
 	cur := serverList.GetCurrentItem()
@@ -995,22 +935,14 @@ func rebuildServerList() {
 		serverList.AddItem(strings.TrimRight(line, " "), "", 0, nil)
 	}
 
-	var groups []string
-	seen := map[string]bool{}
 	for _, s := range servers {
 		if connected[s.Name] {
 			addServer(s, "")
 		}
 	}
 	for _, s := range servers {
-		if connected[s.Name] {
-			continue
-		}
-		if s.Group == "" {
+		if !connected[s.Name] && s.Group == "" {
 			addServer(s, "")
-		} else if !seen[s.Group] {
-			seen[s.Group] = true
-			groups = append(groups, s.Group)
 		}
 	}
 	for _, g := range groups {
@@ -1044,67 +976,33 @@ func rebuildServerList() {
 	}
 }
 
-func refreshEnvList() {
-	envList.Clear()
-	files := envFiles()
-	for _, f := range files {
-		envList.AddItem(" "+filepath.Base(f), "", 0, nil)
-	}
-	if len(files) == 0 {
-		envList.AddItem("(no env files)", "", 0, nil)
-	}
-}
+// showServerMenu pops up the small Connect / Edit / Delete menu for a server,
+// hanging just under its row like a classic Mac pop-up menu (or just above
+// it, when the row is too close to the bottom of the screen).
+func showServerMenu(s Server) {
+	l := tview.NewList().ShowSecondaryText(false).SetHighlightFullLine(true)
+	l.SetMainTextStyle(rowStyle).SetSelectedStyle(selectedRowStyle).
+		SetShortcutStyle(rowStyle.Foreground(tcell.ColorDimGray))
+	l.SetBorder(true).SetTitle(" " + s.Name + " ")
+	l.AddItem("Connect", "", 'c', func() { closeModal(); selectServer(s) })
+	l.AddItem("Edit…", "", 'e', func() { closeModal(); showServerEditForm(s) })
+	l.AddItem("Delete…", "", 'd', func() { closeModal(); confirmDeleteServer(s) })
 
-func selectEnvFile(path string) {
-	dialog("envAction",
-		fmt.Sprintf("“%s”", filepath.Base(path)),
-		[]string{"Edit", "Duplicate", "Delete", "Cancel"},
-		func(label string) {
-			switch label {
-			case "Edit":
-				showEnvEditForm(path)
-			case "Duplicate":
-				newEnvFileForm(path)
-			case "Delete":
-				dialog("envDelete",
-					fmt.Sprintf("Delete “%s”?\nThis cannot be undone.", filepath.Base(path)),
-					[]string{"Delete", "Cancel"},
-					func(label string) {
-						if label != "Delete" {
-							return
-						}
-						if err := os.Remove(path); err != nil {
-							errModal(err.Error())
-							return
-						}
-						refreshEnvList()
-					})
-			}
-		})
-}
-
-func showEnvEditForm(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		errModal(err.Error())
-		return
+	w := max(utf8.RuneCountInString(s.Name)+6, 18)
+	h := l.GetItemCount() + 2
+	ix, iy, _, _ := serverList.GetInnerRect()
+	off, _ := serverList.GetOffset()
+	row := iy + (serverList.GetCurrentItem()-off)*serverList.lines
+	_, _, sw, sh := pages.GetRect()
+	x, y := ix+2, row+1
+	if y+h >= sh { // +1 for the drop shadow
+		y = row - h
 	}
-	form := tview.NewForm().
-		AddTextArea("Content", string(data), 60, 8, 0, nil)
-	styleForm(form)
-	form.AddButton("Save", func() {
-		content := form.GetFormItemByLabel("Content").(*tview.TextArea).GetText()
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			errModal(err.Error())
-			return
-		}
-		closeModal()
-	})
-	form.AddButton("Cancel", closeModal)
-	form.SetCancelFunc(closeModal)
-	form.SetBorder(true)
-	form.SetTitle(fmt.Sprintf(" Edit %s ", filepath.Base(path)))
-	showModal("envEdit", form, 76, 14)
+	x = max(0, min(x, sw-w-1))
+	y = max(0, y)
+
+	modals = append(modals, modalEntry{name: "serverMenu", prim: l, menu: true})
+	pages.AddPage("serverMenu", placeAt(l, x, y, w, h), true, true)
 }
 
 // selecting is true while selectServer's fresh master check is in flight, so
@@ -1112,9 +1010,10 @@ func showEnvEditForm(path string) {
 // Only touched on the UI goroutine.
 var selecting bool
 
-// selectServer freshly checks the server's master and opens the matching
-// dialog. The check runs off the UI goroutine: against a wedged master it
-// takes the full aliveTimeout, which would otherwise freeze the whole UI.
+// selectServer freshly checks the server's master and connects, asking first
+// whether to reuse it when one is live. The check runs off the UI goroutine:
+// against a wedged master it takes the full aliveTimeout, which would
+// otherwise freeze the whole UI.
 func selectServer(s Server) {
 	if selecting {
 		return
@@ -1132,7 +1031,7 @@ func selectServer(s Server) {
 				rebuildServerList()
 			}
 			if !ok {
-				showEnvChooser(s)
+				connect(s, false)
 				return
 			}
 			dialog("reuse",
@@ -1141,68 +1040,194 @@ func selectServer(s Server) {
 				func(label string) {
 					switch label {
 					case "Reuse":
-						connect(s, "", true)
+						connect(s, true)
 					case "New connection":
-						showEnvChooser(s)
+						connect(s, false)
 					}
 				})
 		})
 	}()
 }
 
-func showEnvChooser(s Server) {
-	files := envFiles()
-	l := tview.NewList().ShowSecondaryText(false)
-	l.SetBorder(true).SetTitle(fmt.Sprintf(" Env file for %s ", s.Name))
-	for _, f := range files {
-		f := f
-		l.AddItem(filepath.Base(f), "", 0, func() {
-			closeModal()
-			connect(s, f, false)
-		})
+// currentFolder is the folder the highlighted row belongs to (or is), so a
+// new server lands where the user is looking.
+func currentFolder() string {
+	i := serverList.GetCurrentItem()
+	if i < 0 || i >= len(serverRows) {
+		return ""
 	}
-	l.AddItem("(plain shell — no env file)", "", 0, func() {
-		closeModal()
-		connect(s, "", false)
-	})
-	l.AddItem("Cancel", "", 0, closeModal)
-	l.SetDoneFunc(closeModal)
-	showModal("env", l, 50, len(files)+4)
+	if r := serverRows[i]; r.header != "" {
+		return r.header
+	}
+	return serverRows[i].server.Group
 }
 
-func showServerForm() {
+func showServerForm() { serverForm(nil) }
+
+func showServerEditForm(s Server) { serverForm(&s) }
+
+// serverForm opens the server dialog: blank for a new server, or filled in
+// with every setting of orig for editing it.
+func serverForm(orig *Server) {
+	const noFolder = "(none)"
+	s := Server{Port: "22", Group: currentFolder()}
+	title, name := " New server ", "serverForm"
+	if orig != nil {
+		s = *orig
+		title, name = fmt.Sprintf(" Edit %s ", orig.Name), "serverEdit"
+	}
+	user, host, hasUser := strings.Cut(s.Target, "@")
+	if !hasUser {
+		user, host = "", s.Target
+	}
+	folders := append([]string{noFolder}, groups...)
+	folderIdx := 0
+	for i, g := range groups {
+		if g == s.Group {
+			folderIdx = i + 1
+		}
+	}
+
 	form := tview.NewForm().
-		AddInputField("Name", "", 30, nil, nil).
-		AddInputField("Target (user@host)", "", 30, nil, nil).
-		AddInputField("Port", "22", 6, nil, nil).
-		AddInputField("Group (optional)", "", 30, nil, nil)
+		AddInputField("Name", s.Name, 30, nil, nil).
+		AddInputField("User (optional)", user, 30, nil, nil).
+		AddInputField("Host", host, 30, nil, nil).
+		AddInputField("Port", s.Port, 6, nil, nil).
+		AddDropDown("Folder", folders, folderIdx, nil)
 	styleForm(form)
+	drop := form.GetFormItemByLabel("Folder").(*tview.DropDown)
+	drop.SetListStyles(rowStyle, selectedRowStyle)
+	text := func(label string) string {
+		return strings.TrimSpace(form.GetFormItemByLabel(label).(*tview.InputField).GetText())
+	}
 	form.AddButton("Save", func() {
-		name := strings.TrimSpace(form.GetFormItemByLabel("Name").(*tview.InputField).GetText())
-		target := strings.TrimSpace(form.GetFormItemByLabel("Target (user@host)").(*tview.InputField).GetText())
-		port := strings.TrimSpace(form.GetFormItemByLabel("Port").(*tview.InputField).GetText())
-		group := strings.TrimSpace(form.GetFormItemByLabel("Group (optional)").(*tview.InputField).GetText())
-		if !validName(name) {
+		next := Server{Name: text("Name"), Port: text("Port")}
+		user, host := text("User (optional)"), text("Host")
+		if i, _ := drop.GetCurrentOption(); i > 0 {
+			next.Group = groups[i-1]
+		}
+		if !validName(next.Name) {
 			errModal("Name is required and may not contain spaces, slashes\nor a leading “-” or “[”.")
 			return
 		}
-		for _, s := range servers {
-			if s.Name == name {
-				errModal(fmt.Sprintf("A server named “%s” already exists.", name))
+		for _, o := range servers {
+			if o.Name == next.Name && (orig == nil || o.Name != orig.Name) {
+				errModal(fmt.Sprintf("A server named “%s” already exists.", next.Name))
 				return
 			}
 		}
-		if target == "" || strings.ContainsAny(target, " \t:") || strings.HasPrefix(target, "-") {
-			errModal("Target is required, e.g. deploy@203.0.113.10\n(no port here — that goes in the Port field).")
+		if strings.ContainsAny(user, " \t:@") || strings.HasPrefix(user, "-") {
+			errModal("User may not contain spaces, “:” or “@”,\nor start with “-”.")
 			return
 		}
-		if !validPort(port) {
+		if host == "" || strings.ContainsAny(host, " \t:@") || strings.HasPrefix(host, "-") {
+			errModal("Host is required, e.g. 203.0.113.10 or db.internal\n(no user or port here — they have their own fields).")
+			return
+		}
+		if !validPort(next.Port) {
 			errModal("Port must be a number between 1 and 65535.")
 			return
 		}
-		if strings.ContainsAny(group, "[]#") {
-			errModal("Group may not contain brackets or #.")
+		next.Target = host
+		if user != "" {
+			next.Target = user + "@" + host
+		}
+
+		path := filepath.Join(baseDir, serversFileName)
+		data, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			errModal(err.Error())
 			return
+		}
+		content := string(data)
+		entry := fmt.Sprintf("%s %s:%s", next.Name, next.Target, next.Port)
+		switch {
+		case orig == nil:
+			content = insertServerLine(content, entry, next.Group)
+		case orig.Group == next.Group:
+			content = replaceServerLine(content, orig.Name, entry)
+		default:
+			content = insertServerLine(replaceServerLine(content, orig.Name, ""), entry, next.Group)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			errModal(err.Error())
+			return
+		}
+		collapsed[next.Group] = false // keep the entry in view
+		closeModal()
+		// A live master is keyed by name and port and was opened to the old
+		// target; once any of those change it would be orphaned, or worse,
+		// reused for the wrong host.
+		var stale *Server
+		if orig != nil && (orig.Name != next.Name || orig.Target != next.Target || orig.Port != next.Port) {
+			stale = orig
+		}
+		serversChanged(stale)
+	})
+	form.AddButton("Cancel", closeModal)
+	form.SetCancelFunc(closeModal)
+	form.SetBorder(true)
+	form.SetTitle(title)
+	showModal(name, form, 56, 15)
+	modals[len(modals)-1].drop = drop
+}
+
+func confirmDeleteServer(s Server) {
+	dialog("serverDelete",
+		fmt.Sprintf("Delete “%s” (%s:%s)?\nThis cannot be undone.", s.Name, s.Target, s.Port),
+		[]string{"Delete", "Cancel"},
+		func(label string) {
+			if label != "Delete" {
+				return
+			}
+			path := filepath.Join(baseDir, serversFileName)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				errModal(err.Error())
+				return
+			}
+			if err := os.WriteFile(path, []byte(replaceServerLine(string(data), s.Name, "")), 0o600); err != nil {
+				errModal(err.Error())
+				return
+			}
+			serversChanged(&s)
+		})
+}
+
+// serversChanged reloads the list after the servers file was written. When
+// stale is set, that server's master is stopped first — off the UI goroutine,
+// since a wedged one takes the full aliveTimeout — so the status scan that
+// follows doesn't still find it live.
+func serversChanged(stale *Server) {
+	if stale == nil {
+		refreshServers()
+		return
+	}
+	refreshData()
+	s := *stale
+	go func() {
+		stopMaster(s)
+		app.QueueUpdateDraw(refreshServers)
+	}()
+}
+
+// showFolderForm opens the New-folder dialog. The folder is written as an
+// empty [group] section at the end of the servers file, ready for servers to
+// be added or moved into it.
+func showFolderForm() {
+	form := tview.NewForm().AddInputField("Folder name", "", 30, nil, nil)
+	styleForm(form)
+	form.AddButton("Save", func() {
+		g := strings.TrimSpace(form.GetFormItemByLabel("Folder name").(*tview.InputField).GetText())
+		if !validGroup(g) {
+			errModal("Folder name is required and may not contain\nbrackets or #.")
+			return
+		}
+		for _, o := range groups {
+			if o == g {
+				errModal(fmt.Sprintf("A folder named “%s” already exists.", g))
+				return
+			}
 		}
 		path := filepath.Join(baseDir, serversFileName)
 		data, err := os.ReadFile(path)
@@ -1210,82 +1235,19 @@ func showServerForm() {
 			errModal(err.Error())
 			return
 		}
-		content := insertServerLine(string(data), fmt.Sprintf("%s %s:%s", name, target, port), group)
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		if err := os.WriteFile(path, []byte(appendGroup(string(data), g)), 0o600); err != nil {
 			errModal(err.Error())
 			return
 		}
-		collapsed[group] = false // make the new entry visible right away
+		collapsed[g] = false
 		closeModal()
-		refreshServers()
+		refreshData()
 	})
 	form.AddButton("Cancel", closeModal)
 	form.SetCancelFunc(closeModal)
 	form.SetBorder(true)
-	form.SetTitle(" New server ")
-	showModal("serverForm", form, 56, 13)
-}
-
-func showEnvFileForm() { newEnvFileForm("") }
-
-// duplicateCurrentEnv opens the new-file form prefilled with the env file
-// highlighted in the env pane ("d" key or the bar's Duplicate button).
-func duplicateCurrentEnv() {
-	files := envFiles()
-	if i := envList.GetCurrentItem(); i >= 0 && i < len(files) {
-		newEnvFileForm(files[i])
-	}
-}
-
-// newEnvFileForm opens the New-env-file dialog. A non-empty copyPath (the
-// Duplicate flow: "d" on a highlighted env file, or the Duplicate button)
-// prefills the form with that file's content and a name for the copy.
-func newEnvFileForm(copyPath string) {
-	name, content := "", envTemplate
-	title := " New env file "
-	if copyPath != "" {
-		data, err := os.ReadFile(copyPath)
-		if err != nil {
-			errModal(err.Error())
-			return
-		}
-		content = string(data)
-		name = strings.TrimSuffix(filepath.Base(copyPath), ".txt") + "_copy"
-		title = fmt.Sprintf(" New env file (copy of %s) ", filepath.Base(copyPath))
-	}
-
-	form := tview.NewForm().
-		AddInputField("File name", name, 30, nil, nil).
-		AddTextArea("Content", content, 60, 8, 0, nil)
-	styleForm(form)
-	form.AddButton("Save", func() {
-		name := strings.TrimSpace(form.GetFormItemByLabel("File name").(*tview.InputField).GetText())
-		name = filepath.Base(name) // keep it inside baseDir
-		if name == "" || name == "." || name == serversFileName || name == configFileName {
-			errModal("Please enter a valid file name.")
-			return
-		}
-		if !strings.HasSuffix(name, ".txt") {
-			name += ".txt"
-		}
-		if _, err := os.Stat(filepath.Join(baseDir, name)); err == nil {
-			errModal(fmt.Sprintf("“%s” already exists.\nPick another name, or use Edit to change it.", name))
-			return
-		}
-		content := form.GetFormItemByLabel("Content").(*tview.TextArea).GetText()
-		if err := os.WriteFile(filepath.Join(baseDir, name), []byte(content), 0o600); err != nil {
-			errModal(err.Error())
-			return
-		}
-		closeModal()
-		refreshEnvList()
-	})
-	form.AddButton("Cancel", closeModal)
-	form.SetCancelFunc(closeModal)
-	form.SetBorder(true)
-	form.SetTitle(title)
-	// 8-line text area + file-name row + buttons + form padding + border.
-	showModal("envForm", form, 76, 16)
+	form.SetTitle(" New folder ")
+	showModal("folderForm", form, 50, 7)
 }
 
 func errModal(msg string) {
@@ -1535,6 +1497,18 @@ func (s shadowed) Draw(screen tcell.Screen) {
 		screen.SetContent(x+w, j, ' ', nil, st)
 	}
 	s.Primitive.Draw(screen)
+}
+
+// placeAt wraps p in a fixed-size box at screen position x, y, with a drop
+// shadow.
+func placeAt(p tview.Primitive, x, y, w, h int) tview.Primitive {
+	return tview.NewFlex().
+		AddItem(nil, x, 0, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, y, 0, false).
+			AddItem(shadowed{p}, h, 0, true).
+			AddItem(nil, 0, 1, false), w, 0, true).
+		AddItem(nil, 0, 1, false)
 }
 
 // center wraps p in a fixed-size centered box with a drop shadow.
