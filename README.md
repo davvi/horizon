@@ -147,16 +147,16 @@ keep running).
 `list_of_servers.txt`; it shows up in the list straight away, ready for
 servers to be created in it or moved into it with **Edit**.
 
-Connecting to a server that already has a live connection pops up a choice:
-**Reuse** opens a new session over the existing connection instantly (no
-re-authentication); **New connection** closes the old one and reconnects
-fresh.
+When a server already has a live connection, its menu starts with **Reuse
+connection** (`r`), which opens a new session over that connection instantly
+(no re-authentication). **Connect** then closes the old connection and
+reconnects fresh.
 
 When you pick a server, Horizon's UI closes and hands your terminal directly to
 `ssh` — typing `exit` on the remote host drops you straight back into the local
 shell you started from. The underlying connection stays alive in the background
 (`ControlPersist=yes`), so the next `./horizon` run offers instant re-use. It
-lives until you choose "New connection" or kill it yourself with
+lives until you choose **Connect** on it again or kill it yourself with
 `ssh -O exit -o ControlPath=~/.horizon/sockets/<name>-<port> <target>`.
 
 ## Development

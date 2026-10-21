@@ -589,3 +589,42 @@ func TestParsePingAvg(t *testing.T) {
 		t.Fatal("expected no match for error output")
 	}
 }
+
+// menuItems opens the pop-up menu for s and returns its entries, top first.
+func menuItems(t *testing.T, s Server) []string {
+	t.Helper()
+	showServerMenu(s)
+	defer closeModal()
+	l := modals[len(modals)-1].prim.(*tview.List)
+	var out []string
+	for i := 0; i < l.GetItemCount(); i++ {
+		main, _ := l.GetItemText(i)
+		out = append(out, main)
+	}
+	return out
+}
+
+// A server with a live master offers Reuse as the first menu entry; one
+// without doesn't offer it at all.
+func TestServerMenuOffersReuse(t *testing.T) {
+	baseDir = t.TempDir()
+	app = tview.NewApplication()
+	pages = tview.NewPages()
+	pages.AddPage("main", buildMain(), true, true)
+	pages.SetRect(0, 0, 100, 30)
+	s := Server{Name: "web1", Target: "deploy@203.0.113.10", Port: "22"}
+
+	aliveMu.Lock()
+	aliveState = map[string]bool{}
+	aliveMu.Unlock()
+	if got := strings.Join(menuItems(t, s), ","); got != "Connect,Edit…,Delete…" {
+		t.Fatalf("idle menu = %q", got)
+	}
+
+	aliveMu.Lock()
+	aliveState = map[string]bool{"web1": true}
+	aliveMu.Unlock()
+	if got := strings.Join(menuItems(t, s), ","); got != "Reuse connection,Connect,Edit…,Delete…" {
+		t.Fatalf("live menu = %q", got)
+	}
+}

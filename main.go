@@ -817,7 +817,7 @@ func buildMain() tview.Primitive {
 			if s, ok := currentServer(); ok {
 				switch e.Rune() {
 				case 'c':
-					selectServer(s)
+					connect(s, false)
 					return nil
 				case 'e':
 					showServerEditForm(s)
@@ -993,17 +993,31 @@ func rebuildServerList() {
 
 // showServerMenu pops up the small Connect / Edit / Delete menu for a server,
 // hanging just under its row like a classic Mac pop-up menu (or just above
-// it, when the row is too close to the bottom of the screen).
+// it, when the row is too close to the bottom of the screen). A server with a
+// live master gets Reuse on top, and Connect then means a fresh connection
+// that replaces it. Should the master have died since the last scan, Reuse
+// still works: ControlMaster=auto simply opens a new one.
 func showServerMenu(s Server) {
 	l := tview.NewList().ShowSecondaryText(false).SetHighlightFullLine(true)
 	l.SetMainTextStyle(rowStyle).SetSelectedStyle(selectedRowStyle).
 		SetShortcutStyle(rowStyle.Foreground(tcell.ColorDimGray))
 	l.SetBorder(true).SetTitle(" " + s.Name + " ")
-	l.AddItem("Connect", "", 'c', func() { closeModal(); selectServer(s) })
+	if isAlive(s.Name) {
+		l.AddItem("Reuse connection", "", 'r', func() { closeModal(); connect(s, true) })
+	}
+	l.AddItem("Connect", "", 'c', func() { closeModal(); connect(s, false) })
 	l.AddItem("Edit…", "", 'e', func() { closeModal(); showServerEditForm(s) })
 	l.AddItem("Delete…", "", 'd', func() { closeModal(); confirmDeleteServer(s) })
 
-	w := max(utf8.RuneCountInString(s.Name)+6, 18)
+	// Wide enough for the longest entry with its "(x) " shortcut, the title,
+	// the side padding and the border, and never a cramped sliver.
+	l.SetBorderPadding(0, 0, 1, 1)
+	w := utf8.RuneCountInString(s.Name) + 6
+	for i := 0; i < l.GetItemCount(); i++ {
+		main, _ := l.GetItemText(i)
+		w = max(w, utf8.RuneCountInString(main)+4+4)
+	}
+	w = max(w, 30)
 	h := l.GetItemCount() + 2
 	ix, iy, _, _ := serverList.GetInnerRect()
 	off, _ := serverList.GetOffset()
@@ -1018,50 +1032,6 @@ func showServerMenu(s Server) {
 
 	modals = append(modals, modalEntry{name: "serverMenu", prim: l, menu: true})
 	pages.AddPage("serverMenu", placeAt(l, x, y, w, h), true, true)
-}
-
-// selecting is true while selectServer's fresh master check is in flight, so
-// pressing Enter again cannot stack a second check and a duplicate dialog.
-// Only touched on the UI goroutine.
-var selecting bool
-
-// selectServer freshly checks the server's master and connects, asking first
-// whether to reuse it when one is live. The check runs off the UI goroutine:
-// against a wedged master it takes the full aliveTimeout, which would
-// otherwise freeze the whole UI.
-func selectServer(s Server) {
-	if selecting {
-		return
-	}
-	selecting = true
-	go func() {
-		ok := alive(s)
-		aliveMu.Lock()
-		changed := aliveState[s.Name] != ok
-		aliveState[s.Name] = ok
-		aliveMu.Unlock()
-		app.QueueUpdateDraw(func() {
-			selecting = false
-			if changed {
-				rebuildServerList()
-			}
-			if !ok {
-				connect(s, false)
-				return
-			}
-			dialog("reuse",
-				fmt.Sprintf("A live connection to “%s” already exists.\nReuse it or create a new one?", s.Name),
-				[]string{"Reuse", "New connection", "Cancel"},
-				func(label string) {
-					switch label {
-					case "Reuse":
-						connect(s, true)
-					case "New connection":
-						connect(s, false)
-					}
-				})
-		})
-	}()
 }
 
 // currentFolder is the folder the highlighted row belongs to (or is), so a
