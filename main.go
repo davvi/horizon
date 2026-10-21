@@ -748,7 +748,7 @@ func buildMain() tview.Primitive {
 	bar.AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorWhite), 0, 1, false)
 
 	help := tview.NewTextView().
-		SetText(" Enter: server menu / open-close folder   Tab: switch focus   arrows/mouse: navigate").
+		SetText(" Enter: server menu / open-close folder   c/e/d: connect/edit/delete   Tab: switch focus").
 		SetTextColor(tcell.ColorDimGray)
 
 	root := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -811,6 +811,21 @@ func buildMain() tview.Primitive {
 			case 'q':
 				app.Stop()
 				return nil
+			}
+			// The server menu's own shortcuts also work straight from the
+			// list, on the highlighted server, without opening the menu.
+			if s, ok := currentServer(); ok {
+				switch e.Rune() {
+				case 'c':
+					selectServer(s)
+					return nil
+				case 'e':
+					showServerEditForm(s)
+					return nil
+				case 'd':
+					confirmDeleteServer(s)
+					return nil
+				}
 			}
 		}
 		return e
@@ -1060,6 +1075,16 @@ func currentFolder() string {
 		return r.header
 	}
 	return serverRows[i].server.Group
+}
+
+// currentServer is the server on the highlighted row; ok is false on a
+// folder header or an empty list.
+func currentServer() (Server, bool) {
+	i := serverList.GetCurrentItem()
+	if i < 0 || i >= len(serverRows) || serverRows[i].header != "" {
+		return Server{}, false
+	}
+	return serverRows[i].server, true
 }
 
 func showServerForm() { serverForm(nil) }

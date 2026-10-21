@@ -125,6 +125,7 @@ a page, or just use the mouse wheel and arrow keys.
 | -------------- | ------------------------------------------ |
 | ↑/↓, Enter     | choose a server and open its menu          |
 | Enter on a folder | open / close the folder                 |
+| `c` / `e` / `d` | connect / edit / delete the selected server |
 | `n`            | new server form                            |
 | `f`            | new folder                                 |
 | `r`            | refresh the list and connection statuses   |
@@ -132,7 +133,9 @@ a page, or just use the mouse wheel and arrow keys.
 | Tab / Esc      | move focus / close a dialog or menu        |
 
 Clicking a server, or pressing Enter on it, pops up a small menu under the
-row: **Connect** (`c`), **Edit…** (`e`) and **Delete…** (`d`). **Edit** opens
+row: **Connect** (`c`), **Edit…** (`e`) and **Delete…** (`d`). The same keys
+also work straight from the list on the highlighted server, with no menu
+open. **Edit** opens
 a form with every setting of the host — name, user, host, port and folder —
 and saves it back to `list_of_servers.txt` in place, comments and all. Moving
 a server to another folder moves its line into that folder's section.
