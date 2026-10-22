@@ -126,6 +126,7 @@ a page, or just use the mouse wheel and arrow keys.
 | ↑/↓, Enter     | choose a server and open its menu          |
 | Enter on a folder | open / close the folder                 |
 | `c` / `e` / `d` | connect / edit / delete the selected server |
+| `d` on a folder | delete the folder (keep or delete its servers) |
 | `n`            | new server form                            |
 | `f`            | new folder                                 |
 | `r`            | refresh the list and connection statuses   |

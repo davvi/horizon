@@ -439,6 +439,37 @@ func appendGroup(data, group string) string {
 	return data + "[" + group + "]\n"
 }
 
+// removeGroup returns the servers file content with every [group] section of
+// that name taken out. With keepServers the section's lines (servers and
+// comments alike) move to the top level instead of being dropped.
+func removeGroup(data, group string, keepServers bool) string {
+	var kept, moved []string
+	in := false
+	for _, l := range strings.Split(data, "\n") {
+		if g, ok := groupHeader(strings.TrimSpace(l)); ok {
+			in = g == group
+			if in {
+				continue
+			}
+		}
+		if !in {
+			kept = append(kept, l)
+		} else if strings.TrimSpace(l) != "" {
+			moved = append(moved, l)
+		}
+	}
+	out := strings.TrimRight(strings.Join(kept, "\n"), " \t\n")
+	if out != "" {
+		out += "\n"
+	}
+	if keepServers {
+		for _, l := range moved {
+			out = insertServerLine(out, strings.TrimSpace(l), "")
+		}
+	}
+	return out
+}
+
 // validGroup reports whether a folder name survives a round trip through a
 // [group] header line.
 func validGroup(g string) bool {
@@ -748,7 +779,7 @@ func buildMain() tview.Primitive {
 	bar.AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorWhite), 0, 1, false)
 
 	help := tview.NewTextView().
-		SetText(" Enter: server menu / open-close folder   c/e/d: connect/edit/delete   Tab: switch focus").
+		SetText(" Enter: server menu / open-close folder   c/e/d: connect/edit/delete (d on a folder deletes it)   Tab: switch focus").
 		SetTextColor(tcell.ColorDimGray)
 
 	root := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -826,6 +857,9 @@ func buildMain() tview.Primitive {
 					confirmDeleteServer(s)
 					return nil
 				}
+			} else if g, ok := currentHeader(); ok && e.Rune() == 'd' {
+				confirmDeleteFolder(g)
+				return nil
 			}
 		}
 		return e
@@ -1057,6 +1091,16 @@ func currentServer() (Server, bool) {
 	return serverRows[i].server, true
 }
 
+// currentHeader is the folder on the highlighted row; ok is false unless the
+// row is a folder header.
+func currentHeader() (string, bool) {
+	i := serverList.GetCurrentItem()
+	if i < 0 || i >= len(serverRows) || serverRows[i].header == "" {
+		return "", false
+	}
+	return serverRows[i].header, true
+}
+
 func showServerForm() { serverForm(nil) }
 
 func showServerEditForm(s Server) { serverForm(&s) }
@@ -1187,6 +1231,53 @@ func confirmDeleteServer(s Server) {
 			}
 			serversChanged(&s)
 		})
+}
+
+// confirmDeleteFolder asks before removing a folder. An empty one just goes;
+// for one with servers the user picks whether those move to the top level or
+// are deleted along with it.
+func confirmDeleteFolder(g string) {
+	var members []Server
+	for _, s := range servers {
+		if s.Group == g {
+			members = append(members, s)
+		}
+	}
+	text := fmt.Sprintf("Delete the empty folder “%s”?", g)
+	buttons := []string{"Delete", "Cancel"}
+	if len(members) > 0 {
+		text = fmt.Sprintf("Delete the folder “%s”?\nIt holds %d server(s). Keep them at the top level,\nor delete them too (cannot be undone)?", g, len(members))
+		buttons = []string{"Keep servers", "Delete all", "Cancel"}
+	}
+	dialog("folderDelete", text, buttons, func(label string) {
+		if label == "" || label == "Cancel" {
+			return
+		}
+		keep := label != "Delete all"
+		path := filepath.Join(baseDir, serversFileName)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			errModal(err.Error())
+			return
+		}
+		if err := os.WriteFile(path, []byte(removeGroup(string(data), g, keep)), 0o600); err != nil {
+			errModal(err.Error())
+			return
+		}
+		delete(collapsed, g)
+		if keep {
+			refreshServers()
+			return
+		}
+		// Same as serversChanged, for every server that went with the folder.
+		refreshData()
+		go func() {
+			for _, s := range members {
+				stopMaster(s)
+			}
+			app.QueueUpdateDraw(refreshServers)
+		}()
+	})
 }
 
 // serversChanged reloads the list after the servers file was written. When

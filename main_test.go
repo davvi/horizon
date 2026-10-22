@@ -275,6 +275,26 @@ func TestAppendGroup(t *testing.T) {
 	}
 }
 
+func TestRemoveGroup(t *testing.T) {
+	base := "jump ops@jump\n[db]\n# primary\npg1 root@10.0.0.1:22\n\n[web]\nweb1 deploy@10.0.0.2:22\n[db]\npg2 root@10.0.0.3:22\n"
+
+	got := removeGroup(base, "db", false)
+	want := "jump ops@jump\n[web]\nweb1 deploy@10.0.0.2:22\n"
+	if got != want {
+		t.Errorf("delete all:\n got %q\nwant %q", got, want)
+	}
+
+	got = removeGroup(base, "db", true)
+	want = "jump ops@jump\n# primary\npg1 root@10.0.0.1:22\npg2 root@10.0.0.3:22\n[web]\nweb1 deploy@10.0.0.2:22\n"
+	if got != want {
+		t.Errorf("keep servers:\n got %q\nwant %q", got, want)
+	}
+
+	if got := removeGroup(base, "missing", true); got != base {
+		t.Errorf("unknown folder changed the file: %q", got)
+	}
+}
+
 func TestValidGroup(t *testing.T) {
 	for _, g := range []string{"prod", "eu west", "db-1"} {
 		if !validGroup(g) {
