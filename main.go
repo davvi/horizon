@@ -83,6 +83,7 @@ type modalEntry struct {
 	prim tview.Primitive
 	drop *tview.DropDown // a picker in the dialog that may hang outside it
 	menu bool            // a pop-up menu: a click outside dismisses it
+	back tview.Primitive // what had focus when this dialog opened
 }
 
 // pendingConn is an ssh session to start after the TUI has fully shut down,
@@ -168,6 +169,12 @@ func main() {
 	pages = tview.NewPages()
 	pages.AddPage("main", buildMain(), true, true)
 	refreshData()
+	reloadPorts()
+	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		w, _ := screen.Size()
+		applySidebarWidth(w)
+		return false
+	})
 
 	// Nothing that touches the network runs before the first frame: the list is
 	// drawn from the text files alone, and the scans (ssh master checks, and the
@@ -225,6 +232,7 @@ func ensureFiles() error {
 	templates := map[string]string{
 		serversFileName: serversTemplate,
 		configFileName:  configTemplate,
+		portsFileName:   portsTemplate,
 	}
 	for name, tmpl := range templates {
 		p := filepath.Join(baseDir, name)
@@ -516,7 +524,11 @@ func refreshAlive(list []Server) {
 	for _, s := range list {
 		s := s
 		go func() {
+			checkedAt := time.Now()
 			ok := alive(s)
+			if !ok {
+				clearStaleForwards(s, checkedAt)
+			}
 			aliveMu.Lock()
 			changed := aliveState[s.Name] != ok
 			aliveState[s.Name] = ok
@@ -532,8 +544,10 @@ func refreshAlive(list []Server) {
 // "-O exit" it leaves sessions already running over it alone; the master goes
 // away once the last of them ends. Used when a server is deleted or its
 // address changes, so the old master is neither orphaned nor reused for the
-// wrong host.
+// wrong host. Its port forwards are cancelled first: they would otherwise
+// outlive the server they were opened for.
 func stopMaster(s Server) {
+	cancelForwards(s)
 	ctx, cancel := context.WithTimeout(context.Background(), aliveTimeout)
 	defer cancel()
 	exec.CommandContext(ctx, "ssh",
@@ -700,7 +714,33 @@ func connect(s Server, reuse bool) {
 	if !reuse {
 		pending.killSock = sock
 	}
+	// A fresh master, or one ControlMaster=auto opens in place of a dead one,
+	// starts without forwards.
+	if !reuse || !isAlive(s.Name) {
+		removeForwards(s)
+	}
 	app.Stop()
+}
+
+// connectFresh is Connect: a new master replacing any live one. When the live
+// one carries port forwards, which the new one would drop, it asks first.
+func connectFresh(s Server) {
+	n := len(activeForwards(s))
+	if n == 0 {
+		connect(s, false)
+		return
+	}
+	dialog("reconnect",
+		fmt.Sprintf("“%s” is forwarding %d port(s).\nA fresh connection closes them.\nReuse the connection instead?", s.Name, n),
+		[]string{"Reuse", "Reconnect", "Cancel"},
+		func(label string) {
+			switch label {
+			case "Reuse":
+				connect(s, true)
+			case "Reconnect":
+				connect(s, false)
+			}
+		})
 }
 
 // ---------- UI ----------
@@ -759,32 +799,46 @@ func buildMain() tview.Primitive {
 		}
 	})
 
-	newSrv := tview.NewButton("New Server (n)").SetSelectedFunc(showServerForm)
-	newFolder := tview.NewButton("New Folder (f)").SetSelectedFunc(showFolderForm)
-	refresh := tview.NewButton("Refresh (r)").SetSelectedFunc(refreshServers)
+	// The menu bar is for the mouse, and a reminder of the shortcuts; it is
+	// not a Tab stop. A click hands focus straight back to the server list,
+	// so the shortcuts keep working and dialogs return there.
+	fromBar := func(f func()) func() {
+		return func() {
+			app.SetFocus(serverList)
+			f()
+		}
+	}
+	newSrv := tview.NewButton("New Server (n)").SetSelectedFunc(fromBar(showServerForm))
+	newFolder := tview.NewButton("New Folder (f)").SetSelectedFunc(fromBar(showFolderForm))
+	refresh := tview.NewButton("Refresh (r)").SetSelectedFunc(fromBar(refreshServers))
+	settings := tview.NewButton("Settings (s)").SetSelectedFunc(fromBar(toggleSidebar))
 	quit := tview.NewButton("Quit (q)").SetSelectedFunc(app.Stop)
-	for _, b := range []*tview.Button{newSrv, newFolder, refresh, quit} {
+	buttons := []*tview.Button{newSrv, newFolder, refresh, settings, quit}
+	for _, b := range buttons {
 		b.SetStyle(tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorBlack))
 		b.SetActivatedStyle(tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite))
 	}
-	focusRing = []tview.Primitive{serverList, newSrv, newFolder, refresh, quit}
+	side := buildSidebar()
+	focusRing = append([]tview.Primitive{serverList}, sidebarItems...)
 
 	// White strip across the top with flat items, like the classic menu bar.
 	bar := tview.NewFlex()
 	bar.AddItem(tview.NewTextView().SetText(" ⌘").SetBackgroundColor(tcell.ColorWhite), 3, 0, false)
-	for _, p := range focusRing[1:] {
-		b := p.(*tview.Button)
+	for _, b := range buttons {
 		bar.AddItem(b, len(b.GetLabel())+2, 0, false)
 	}
 	bar.AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorWhite), 0, 1, false)
 
 	help := tview.NewTextView().
-		SetText(" Enter: server menu / open-close folder   c/e/l/d: connect/edit/clone/delete (d on a folder deletes it)   Tab: switch focus").
+		SetText(" Tab: switch pane   ↑/↓: move   Enter: menu / open folder   c/e/l/d: connect/edit/clone/delete   p/x: forward/stop ports   s: settings").
 		SetTextColor(tcell.ColorDimGray)
 
+	body = tview.NewFlex().
+		AddItem(serverList, 0, 1, true).
+		AddItem(side, sidebarWidth, 0, false)
 	root := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(bar, 1, 0, false).
-		AddItem(serverList, 0, 1, true).
+		AddItem(body, 0, 1, true).
 		AddItem(help, 1, 0, false)
 
 	app.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
@@ -794,38 +848,22 @@ func buildMain() tview.Primitive {
 			if d := modals[len(modals)-1].drop; d != nil && d.IsOpen() {
 				return e
 			}
-			// Esc always closes the top dialog, wherever focus is.
+			// Esc always closes the top dialog, wherever focus is. Moving
+			// around inside it is formNav's job.
 			if e.Key() == tcell.KeyEscape {
 				closeModal()
 				return nil
 			}
-			// On a focused button the arrow keys move between buttons just
-			// like Tab/Backtab. The check keeps arrows editing text normally
-			// when a form field (input or text area) has focus instead.
-			if _, ok := app.GetFocus().(*tview.Button); ok {
-				switch e.Key() {
-				case tcell.KeyLeft, tcell.KeyUp:
-					return tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModNone)
-				case tcell.KeyRight, tcell.KeyDown:
-					return tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone)
-				}
-			}
 			return e
+		}
+		// The sidebar can vanish under the focus when the terminal narrows;
+		// keys then go back to the server list.
+		if !sidebarVisible && inSidebar(app.GetFocus()) {
+			app.SetFocus(serverList)
 		}
 		switch e.Key() {
 		case tcell.KeyTab, tcell.KeyBacktab:
-			cur := 0
-			for i, p := range focusRing {
-				if app.GetFocus() == p {
-					cur = i
-					break
-				}
-			}
-			step := 1
-			if e.Key() == tcell.KeyBacktab {
-				step = len(focusRing) - 1
-			}
-			app.SetFocus(focusRing[(cur+step)%len(focusRing)])
+			switchPane(e.Key() == tcell.KeyBacktab)
 			return nil
 		}
 		if app.GetFocus() == serverList {
@@ -839,6 +877,9 @@ func buildMain() tview.Primitive {
 			case 'r':
 				refreshServers()
 				return nil
+			case 's':
+				toggleSidebar()
+				return nil
 			case 'q':
 				app.Stop()
 				return nil
@@ -848,7 +889,15 @@ func buildMain() tview.Primitive {
 			if s, ok := currentServer(); ok {
 				switch e.Rune() {
 				case 'c':
-					connect(s, false)
+					connectFresh(s)
+					return nil
+				case 'p':
+					showForwardDialog(s)
+					return nil
+				case 'x':
+					if len(activeForwards(s)) > 0 {
+						stopForwards(s)
+					}
 					return nil
 				case 'e':
 					showServerEditForm(s)
@@ -892,13 +941,355 @@ func buildMain() tview.Primitive {
 	return root
 }
 
+// Panes of the main screen, in Tab order.
+const (
+	paneServers = iota
+	paneSettings
+	panePorts
+	paneCount
+)
+
+// currentPane is the pane holding the focus; anything else (a menu bar
+// button under the mouse) counts as the server list.
+func currentPane() int {
+	f := app.GetFocus()
+	switch {
+	case f == portList:
+		return panePorts
+	case inSettings(f):
+		return paneSettings
+	}
+	return paneServers
+}
+
+// switchPane moves the focus to the next pane (Tab) or the previous one
+// (Backtab), skipping the sidebar's panes while it is hidden. Within a pane
+// the arrow keys do the moving.
+func switchPane(back bool) {
+	step := 1
+	if back {
+		step = paneCount - 1
+	}
+	next := (currentPane() + step) % paneCount
+	for !sidebarVisible && next != paneServers {
+		next = (next + step) % paneCount
+	}
+	switch next {
+	case paneSettings:
+		app.SetFocus(settingsItems[settingsIdx])
+	case panePorts:
+		app.SetFocus(portList)
+	default:
+		app.SetFocus(serverList)
+	}
+}
+
+// formNav drives a dialog's form from the keyboard. Tab and Backtab walk
+// every stop in order — each field (each box of a checkbox row), then each
+// button, then round again. The arrows move within an area: ↑/↓ between
+// fields, ←/→ between buttons, ↑ on a button back to the field used last.
+// above, when set, is a pane sitting over the fields (the Forward ports
+// checklist): the first stop, and what ↑ on the first field reaches. A form
+// with no fields, a plain alert, steps through its buttons with the arrows
+// too.
+type formNav struct {
+	form  *tview.Form
+	above tview.Primitive
+	last  int // the field used last; -1 for above
+}
+
+func navigate(form *tview.Form, above tview.Primitive) *formNav {
+	n := &formNav{form: form, above: above}
+	if above != nil {
+		n.last = -1
+	}
+	form.SetInputCapture(n.capture)
+	return n
+}
+
+// fields lists the indexes of the form items that take focus: all but text
+// views, which only explain.
+func (n *formNav) fields() []int {
+	var out []int
+	for i := 0; i < n.form.GetFormItemCount(); i++ {
+		if _, ok := n.form.GetFormItem(i).(*tview.TextView); !ok {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// focus moves to the form's element at index — items first, then buttons.
+func (n *formNav) focus(index int) {
+	n.form.SetFocus(index)
+	app.SetFocus(n.form)
+}
+
+// navStop is one place Tab can land, and how to get there.
+type navStop struct {
+	p     tview.Primitive
+	focus func()
+}
+
+// stops lists the dialog's Tab stops in order.
+func (n *formNav) stops() []navStop {
+	var out []navStop
+	if n.above != nil {
+		out = append(out, navStop{n.above, func() {
+			n.last = -1
+			app.SetFocus(n.above)
+		}})
+	}
+	for _, i := range n.fields() {
+		i := i
+		if r, ok := n.form.GetFormItem(i).(*checkRow); ok {
+			for j, c := range r.boxes {
+				if r.shown[j] {
+					j := j
+					out = append(out, navStop{c, func() {
+						r.cur, n.last = j, i
+						n.focus(i)
+					}})
+				}
+			}
+			continue
+		}
+		out = append(out, navStop{n.form.GetFormItem(i), func() {
+			n.last = i
+			n.focus(i)
+		}})
+	}
+	items := n.form.GetFormItemCount()
+	for b := 0; b < n.form.GetButtonCount(); b++ {
+		b := b
+		out = append(out, navStop{n.form.GetButton(b), func() { n.focus(items + b) }})
+	}
+	return out
+}
+
+// tab moves to the next Tab stop, or the previous one with back.
+func (n *formNav) tab(back bool) {
+	stops := n.stops()
+	if len(stops) == 0 {
+		return
+	}
+	cur, f := 0, app.GetFocus()
+	for i, st := range stops {
+		if st.p == f {
+			cur = i
+		}
+	}
+	step := 1
+	if back {
+		step = len(stops) - 1
+	}
+	stops[(cur+step)%len(stops)].focus()
+}
+
+func (n *formNav) toFields() {
+	if n.last < 0 && n.above != nil {
+		app.SetFocus(n.above)
+		return
+	}
+	fields := n.fields()
+	if len(fields) == 0 {
+		return
+	}
+	idx := fields[0]
+	for _, i := range fields {
+		if i == n.last {
+			idx = i
+		}
+	}
+	n.focus(idx)
+}
+
+func (n *formNav) capture(e *tcell.EventKey) *tcell.EventKey {
+	item, button := n.form.GetFocusedItemIndex()
+	if item >= 0 {
+		// An open picker takes the arrows for its own list.
+		if d, ok := n.form.GetFormItem(item).(*tview.DropDown); ok && d.IsOpen() {
+			return e
+		}
+	}
+	fields := n.fields()
+	if button >= 0 {
+		items, count := n.form.GetFormItemCount(), n.form.GetButtonCount()
+		switch e.Key() {
+		case tcell.KeyTab, tcell.KeyBacktab:
+			n.tab(e.Key() == tcell.KeyBacktab)
+			return nil
+		}
+		if len(fields) == 0 && n.above == nil {
+			switch e.Key() {
+			case tcell.KeyLeft, tcell.KeyUp:
+				n.focus(items + (button+count-1)%count)
+				return nil
+			case tcell.KeyRight, tcell.KeyDown:
+				n.focus(items + (button+1)%count)
+				return nil
+			}
+			return e
+		}
+		switch e.Key() {
+		case tcell.KeyLeft:
+			n.focus(items + max(button-1, 0))
+			return nil
+		case tcell.KeyRight:
+			n.focus(items + min(button+1, count-1))
+			return nil
+		case tcell.KeyUp:
+			n.toFields()
+			return nil
+		case tcell.KeyDown:
+			return nil
+		}
+		return e
+	}
+	if item < 0 {
+		return e
+	}
+	n.last = item
+	pos := 0
+	for i, f := range fields {
+		if f == item {
+			pos = i
+		}
+	}
+	switch e.Key() {
+	case tcell.KeyTab, tcell.KeyBacktab:
+		n.tab(e.Key() == tcell.KeyBacktab)
+		return nil
+	case tcell.KeyUp:
+		if pos > 0 {
+			n.focus(fields[pos-1])
+		} else if n.above != nil {
+			n.last = -1
+			app.SetFocus(n.above)
+		}
+		return nil
+	case tcell.KeyDown:
+		if pos < len(fields)-1 {
+			n.focus(fields[pos+1])
+		}
+		return nil
+	}
+	return e
+}
+
+// checkRow is a form row of checkboxes side by side, lined up with the
+// form's fields. ←/→ move between them; one that is hidden takes neither
+// room nor focus. formNav treats the row as one field.
+type checkRow struct {
+	*tview.Flex
+	boxes  []*tview.Checkbox
+	shown  []bool
+	cur    int // the box the row focuses
+	indent int // the form's label column
+}
+
+func newCheckRow(labels ...string) *checkRow {
+	r := &checkRow{Flex: tview.NewFlex()}
+	label := tcell.StyleDefault.Background(tcell.ColorSilver).Foreground(tcell.ColorBlack)
+	active := tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite)
+	for i, l := range labels {
+		i := i
+		c := tview.NewCheckbox().SetLabel(l + " ").
+			SetCheckedString(tview.Escape("[x]")).SetUncheckedString(tview.Escape("[ ]")).
+			SetLabelStyle(label)
+		c.SetUncheckedStyle(label).SetCheckedStyle(label).SetActivatedStyle(active)
+		c.SetFocusFunc(func() { r.cur = i })
+		c.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
+			switch e.Key() {
+			case tcell.KeyLeft:
+				r.step(-1)
+				return nil
+			case tcell.KeyRight:
+				r.step(1)
+				return nil
+			}
+			return e
+		})
+		r.boxes = append(r.boxes, c)
+		r.shown = append(r.shown, true)
+	}
+	r.layout()
+	return r
+}
+
+// step moves the focus to the next shown box in direction d, if any.
+func (r *checkRow) step(d int) {
+	for j := r.cur + d; j >= 0 && j < len(r.boxes); j += d {
+		if r.shown[j] {
+			app.SetFocus(r.boxes[j])
+			return
+		}
+	}
+}
+
+func (r *checkRow) layout() {
+	r.Clear()
+	r.AddItem(nil, r.indent, 0, false)
+	for i, c := range r.boxes {
+		if r.shown[i] {
+			r.AddItem(c, utf8.RuneCountInString(c.GetLabel())+3, 0, false)
+			r.AddItem(nil, 3, 0, false)
+		}
+	}
+	r.AddItem(nil, 0, 1, false)
+}
+
+// setShown shows or hides box i, moving the focus off it when it goes.
+func (r *checkRow) setShown(i int, on bool) {
+	if r.shown[i] == on {
+		return
+	}
+	focused := r.HasFocus()
+	r.shown[i] = on
+	if !on && r.cur == i {
+		for j, v := range r.shown {
+			if v {
+				r.cur = j
+				break
+			}
+		}
+	}
+	r.layout()
+	if focused {
+		app.SetFocus(r.boxes[r.cur])
+	}
+}
+
+func (r *checkRow) Focus(delegate func(p tview.Primitive)) { delegate(r.boxes[r.cur]) }
+func (r *checkRow) GetLabel() string                       { return "" }
+func (r *checkRow) GetFieldWidth() int                     { return 0 }
+func (r *checkRow) GetFieldHeight() int                    { return 1 }
+func (r *checkRow) SetDisabled(bool) tview.FormItem        { return r }
+
+func (r *checkRow) SetFormAttributes(labelWidth int, _, _, _, _ tcell.Color) tview.FormItem {
+	if labelWidth != r.indent {
+		r.indent = labelWidth
+		r.layout()
+	}
+	return r
+}
+
+func (r *checkRow) SetFinishedFunc(handler func(key tcell.Key)) tview.FormItem {
+	for _, c := range r.boxes {
+		c.SetFinishedFunc(handler)
+	}
+	return r
+}
+
 // showModal opens p as a centered dialog on top of everything else.
 func showModal(name string, p tview.Primitive, w, h int) {
-	modals = append(modals, modalEntry{name: name, prim: p})
+	modals = append(modals, modalEntry{name: name, prim: p, back: app.GetFocus()})
 	pages.AddPage(name, center(p, w, h), true, true)
 }
 
-// closeModal closes the top dialog and returns focus to what is beneath.
+// closeModal closes the top dialog and returns focus to what is beneath:
+// the dialog below it, or the pane the first dialog was opened from — so
+// closing a port dialog lands back in the sidebar, not the server list.
 func closeModal() {
 	if len(modals) == 0 {
 		return
@@ -908,9 +1299,15 @@ func closeModal() {
 	pages.RemovePage(top.name)
 	if len(modals) > 0 {
 		app.SetFocus(modals[len(modals)-1].prim)
-	} else {
-		app.SetFocus(serverList)
+		return
 	}
+	back := tview.Primitive(serverList)
+	for _, p := range focusRing {
+		if p == top.back && (sidebarVisible || !inSidebar(p)) {
+			back = p
+		}
+	}
+	app.SetFocus(back)
 }
 
 // refreshData redraws the server pane straight from the text files. It
@@ -921,7 +1318,9 @@ func refreshData() {
 }
 
 func refreshServers() {
-	loadConfig() // config.txt edits take effect without a restart
+	loadConfig() // config.txt and ports.txt edits take effect without a restart
+	syncSidebar()
+	reloadPorts()
 	refreshData()
 	refreshAlive(servers)
 	startProbes()
@@ -983,6 +1382,9 @@ func rebuildServerList() {
 		}
 		if connected[s.Name] {
 			line += "  [::b]● connected — reusable[::-]"
+			if fw := readForwards(s); len(fw) > 0 {
+				line += "  " + forwardSummary(fw)
+			}
 		}
 		serverList.AddItem(strings.TrimRight(line, " "), "", 0, nil)
 	}
@@ -1033,7 +1435,8 @@ func rebuildServerList() {
 // it, when the row is too close to the bottom of the screen). A server with a
 // live master gets Reuse on top, and Connect then means a fresh connection
 // that replaces it. Should the master have died since the last scan, Reuse
-// still works: ControlMaster=auto simply opens a new one.
+// still works: ControlMaster=auto simply opens a new one. While it forwards
+// ports, Stop forwards closes them all and keeps the connection.
 func showServerMenu(s Server) {
 	l := tview.NewList().ShowSecondaryText(false).SetHighlightFullLine(true)
 	l.SetMainTextStyle(rowStyle).SetSelectedStyle(selectedRowStyle).
@@ -1042,7 +1445,11 @@ func showServerMenu(s Server) {
 	if isAlive(s.Name) {
 		l.AddItem("Reuse connection", "", 'r', func() { closeModal(); connect(s, true) })
 	}
-	l.AddItem("Connect", "", 'c', func() { closeModal(); connect(s, false) })
+	l.AddItem("Connect", "", 'c', func() { closeModal(); connectFresh(s) })
+	l.AddItem("Forward ports…", "", 'p', func() { closeModal(); showForwardDialog(s) })
+	if len(activeForwards(s)) > 0 {
+		l.AddItem("Stop forwards", "", 'x', func() { closeModal(); stopForwards(s) })
+	}
 	l.AddItem("Edit…", "", 'e', func() { closeModal(); showServerEditForm(s) })
 	l.AddItem("Clone…", "", 'l', func() { closeModal(); showServerCloneForm(s) })
 	l.AddItem("Delete…", "", 'd', func() { closeModal(); confirmDeleteServer(s) })
@@ -1068,7 +1475,7 @@ func showServerMenu(s Server) {
 	x = max(0, min(x, sw-w-1))
 	y = max(0, y)
 
-	modals = append(modals, modalEntry{name: "serverMenu", prim: l, menu: true})
+	modals = append(modals, modalEntry{name: "serverMenu", prim: l, menu: true, back: app.GetFocus()})
 	pages.AddPage("serverMenu", placeAt(l, x, y, w, h), true, true)
 }
 
@@ -1200,29 +1607,6 @@ func serverForm(orig, tmpl *Server) {
 		if user != "" {
 			next.Target = user + "@" + host
 		}
-
-		path := filepath.Join(baseDir, serversFileName)
-		data, err := os.ReadFile(path)
-		if err != nil && !os.IsNotExist(err) {
-			errModal(err.Error())
-			return
-		}
-		content := string(data)
-		entry := fmt.Sprintf("%s %s:%s", next.Name, next.Target, next.Port)
-		switch {
-		case orig == nil:
-			content = insertServerLine(content, entry, next.Group)
-		case orig.Group == next.Group:
-			content = replaceServerLine(content, orig.Name, entry)
-		default:
-			content = insertServerLine(replaceServerLine(content, orig.Name, ""), entry, next.Group)
-		}
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			errModal(err.Error())
-			return
-		}
-		collapsed[next.Group] = false // keep the entry in view
-		closeModal()
 		// A live master is keyed by name and port and was opened to the old
 		// target; once any of those change it would be orphaned, or worse,
 		// reused for the wrong host.
@@ -1230,19 +1614,65 @@ func serverForm(orig, tmpl *Server) {
 		if orig != nil && (orig.Name != next.Name || orig.Target != next.Target || orig.Port != next.Port) {
 			stale = orig
 		}
-		serversChanged(stale)
+		if stale != nil {
+			if n := len(activeForwards(*stale)); n > 0 {
+				dialog("serverEditForwards",
+					fmt.Sprintf("“%s” is forwarding %d port(s).\nChanging its name, host or port closes them.\nSave anyway?", stale.Name, n),
+					[]string{"Save", "Cancel"},
+					func(label string) {
+						if label == "Save" {
+							saveServer(orig, next, stale)
+						}
+					})
+				return
+			}
+		}
+		saveServer(orig, next, stale)
 	})
 	form.AddButton("Cancel", closeModal)
 	form.SetCancelFunc(closeModal)
 	form.SetBorder(true)
 	form.SetTitle(title)
+	navigate(form, nil)
 	showModal(name, form, 56, 15)
 	modals[len(modals)-1].drop = drop
 }
 
+// saveServer writes the server form's result to the servers file — next as a
+// new server, or in place of orig — closes the form and reloads, stopping
+// stale's master when the edit left it pointing at the wrong place.
+func saveServer(orig *Server, next Server, stale *Server) {
+	path := filepath.Join(baseDir, serversFileName)
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		errModal(err.Error())
+		return
+	}
+	content := string(data)
+	entry := fmt.Sprintf("%s %s:%s", next.Name, next.Target, next.Port)
+	switch {
+	case orig == nil:
+		content = insertServerLine(content, entry, next.Group)
+	case orig.Group == next.Group:
+		content = replaceServerLine(content, orig.Name, entry)
+	default:
+		content = insertServerLine(replaceServerLine(content, orig.Name, ""), entry, next.Group)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		errModal(err.Error())
+		return
+	}
+	collapsed[next.Group] = false // keep the entry in view
+	closeModal()
+	serversChanged(stale)
+}
+
 func confirmDeleteServer(s Server) {
-	dialog("serverDelete",
-		fmt.Sprintf("Delete “%s” (%s:%s)?\nThis cannot be undone.", s.Name, s.Target, s.Port),
+	text := fmt.Sprintf("Delete “%s” (%s:%s)?\nThis cannot be undone.", s.Name, s.Target, s.Port)
+	if n := len(activeForwards(s)); n > 0 {
+		text += fmt.Sprintf("\nIts %d forwarded port(s) will be closed.", n)
+	}
+	dialog("serverDelete", text,
 		[]string{"Delete", "Cancel"},
 		func(label string) {
 			if label != "Delete" {
@@ -1362,6 +1792,7 @@ func showFolderForm() {
 	form.SetCancelFunc(closeModal)
 	form.SetBorder(true)
 	form.SetTitle(" New folder ")
+	navigate(form, nil)
 	showModal("folderForm", form, 50, 7)
 }
 
@@ -1380,6 +1811,7 @@ func dialog(name, text string, buttons []string, done func(label string)) {
 		form.AddButton(l, func() { closeModal(); done(l) })
 	}
 	form.SetCancelFunc(func() { closeModal(); done("") })
+	navigate(form, nil)
 
 	tv := tview.NewTextView().SetTextAlign(tview.AlignCenter).SetWordWrap(true).SetText(text)
 	f := tview.NewFlex().SetDirection(tview.FlexRow).

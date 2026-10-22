@@ -647,14 +647,14 @@ func TestServerMenuOffersReuse(t *testing.T) {
 	aliveMu.Lock()
 	aliveState = map[string]bool{}
 	aliveMu.Unlock()
-	if got := strings.Join(menuItems(t, s), ","); got != "Connect,Edit…,Clone…,Delete…" {
+	if got := strings.Join(menuItems(t, s), ","); got != "Connect,Forward ports…,Edit…,Clone…,Delete…" {
 		t.Fatalf("idle menu = %q", got)
 	}
 
 	aliveMu.Lock()
 	aliveState = map[string]bool{"web1": true}
 	aliveMu.Unlock()
-	if got := strings.Join(menuItems(t, s), ","); got != "Reuse connection,Connect,Edit…,Clone…,Delete…" {
+	if got := strings.Join(menuItems(t, s), ","); got != "Reuse connection,Connect,Forward ports…,Edit…,Clone…,Delete…" {
 		t.Fatalf("live menu = %q", got)
 	}
 }
