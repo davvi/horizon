@@ -779,7 +779,7 @@ func buildMain() tview.Primitive {
 	bar.AddItem(tview.NewBox().SetBackgroundColor(tcell.ColorWhite), 0, 1, false)
 
 	help := tview.NewTextView().
-		SetText(" Enter: server menu / open-close folder   c/e/d: connect/edit/delete (d on a folder deletes it)   Tab: switch focus").
+		SetText(" Enter: server menu / open-close folder   c/e/l/d: connect/edit/clone/delete (d on a folder deletes it)   Tab: switch focus").
 		SetTextColor(tcell.ColorDimGray)
 
 	root := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -852,6 +852,9 @@ func buildMain() tview.Primitive {
 					return nil
 				case 'e':
 					showServerEditForm(s)
+					return nil
+				case 'l':
+					showServerCloneForm(s)
 					return nil
 				case 'd':
 					confirmDeleteServer(s)
@@ -1041,6 +1044,7 @@ func showServerMenu(s Server) {
 	}
 	l.AddItem("Connect", "", 'c', func() { closeModal(); connect(s, false) })
 	l.AddItem("Edit…", "", 'e', func() { closeModal(); showServerEditForm(s) })
+	l.AddItem("Clone…", "", 'l', func() { closeModal(); showServerCloneForm(s) })
 	l.AddItem("Delete…", "", 'd', func() { closeModal(); confirmDeleteServer(s) })
 
 	// Wide enough for the longest entry with its "(x) " shortcut, the title,
@@ -1101,16 +1105,41 @@ func currentHeader() (string, bool) {
 	return serverRows[i].header, true
 }
 
-func showServerForm() { serverForm(nil) }
+func showServerForm() { serverForm(nil, nil) }
 
-func showServerEditForm(s Server) { serverForm(&s) }
+func showServerEditForm(s Server) { serverForm(&s, nil) }
 
-// serverForm opens the server dialog: blank for a new server, or filled in
-// with every setting of orig for editing it.
-func serverForm(orig *Server) {
+// showServerCloneForm opens the New-server dialog filled in with s's settings
+// under a fresh name, ready to tweak and save as a separate server.
+func showServerCloneForm(s Server) {
+	s.Name = cloneName(s.Name, servers)
+	serverForm(nil, &s)
+}
+
+// cloneName suggests a name for a copy of name that no server in list uses:
+// name-copy, then name-copy2, name-copy3 and so on.
+func cloneName(name string, list []Server) string {
+	taken := map[string]bool{}
+	for _, s := range list {
+		taken[s.Name] = true
+	}
+	c := name + "-copy"
+	for n := 2; taken[c]; n++ {
+		c = fmt.Sprintf("%s-copy%d", name, n)
+	}
+	return c
+}
+
+// serverForm opens the server dialog: blank for a new server (or prefilled
+// from tmpl when cloning), or filled in with every setting of orig for
+// editing it.
+func serverForm(orig, tmpl *Server) {
 	const noFolder = "(none)"
 	s := Server{Port: "22", Group: currentFolder()}
 	title, name := " New server ", "serverForm"
+	if tmpl != nil {
+		s = *tmpl
+	}
 	if orig != nil {
 		s = *orig
 		title, name = fmt.Sprintf(" Edit %s ", orig.Name), "serverEdit"

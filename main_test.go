@@ -295,6 +295,16 @@ func TestRemoveGroup(t *testing.T) {
 	}
 }
 
+func TestCloneName(t *testing.T) {
+	list := []Server{{Name: "web1"}, {Name: "db"}, {Name: "db-copy"}, {Name: "db-copy2"}}
+	if got := cloneName("web1", list); got != "web1-copy" {
+		t.Errorf("cloneName(web1) = %q", got)
+	}
+	if got := cloneName("db", list); got != "db-copy3" {
+		t.Errorf("cloneName(db) = %q", got)
+	}
+}
+
 func TestValidGroup(t *testing.T) {
 	for _, g := range []string{"prod", "eu west", "db-1"} {
 		if !validGroup(g) {
@@ -637,14 +647,14 @@ func TestServerMenuOffersReuse(t *testing.T) {
 	aliveMu.Lock()
 	aliveState = map[string]bool{}
 	aliveMu.Unlock()
-	if got := strings.Join(menuItems(t, s), ","); got != "Connect,Edit…,Delete…" {
+	if got := strings.Join(menuItems(t, s), ","); got != "Connect,Edit…,Clone…,Delete…" {
 		t.Fatalf("idle menu = %q", got)
 	}
 
 	aliveMu.Lock()
 	aliveState = map[string]bool{"web1": true}
 	aliveMu.Unlock()
-	if got := strings.Join(menuItems(t, s), ","); got != "Reuse connection,Connect,Edit…,Delete…" {
+	if got := strings.Join(menuItems(t, s), ","); got != "Reuse connection,Connect,Edit…,Clone…,Delete…" {
 		t.Fatalf("live menu = %q", got)
 	}
 }

@@ -125,7 +125,7 @@ a page, or just use the mouse wheel and arrow keys.
 | -------------- | ------------------------------------------ |
 | ↑/↓, Enter     | choose a server and open its menu          |
 | Enter on a folder | open / close the folder                 |
-| `c` / `e` / `d` | connect / edit / delete the selected server |
+| `c` / `e` / `l` / `d` | connect / edit / clone / delete the selected server |
 | `d` on a folder | delete the folder (keep or delete its servers) |
 | `n`            | new server form                            |
 | `f`            | new folder                                 |
@@ -134,12 +134,15 @@ a page, or just use the mouse wheel and arrow keys.
 | Tab / Esc      | move focus / close a dialog or menu        |
 
 Clicking a server, or pressing Enter on it, pops up a small menu under the
-row: **Connect** (`c`), **Edit…** (`e`) and **Delete…** (`d`). The same keys
+row: **Connect** (`c`), **Edit…** (`e`), **Clone…** (`l`) and **Delete…** (`d`). The same keys
 also work straight from the list on the highlighted server, with no menu
 open. **Edit** opens
 a form with every setting of the host — name, user, host, port and folder —
 and saves it back to `list_of_servers.txt` in place, comments and all. Moving
 a server to another folder moves its line into that folder's section.
+**Clone** opens the new-server form already filled in with the selected
+server's settings under a fresh name (`web1-copy`); edit whatever differs and
+save it as a separate server, leaving the original untouched.
 Renaming a server, or changing its address, and deleting it each stop the old
 background connection from taking new sessions (sessions already open over it
 keep running).
